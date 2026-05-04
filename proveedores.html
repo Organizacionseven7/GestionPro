@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Proveedores — GestiónPro</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="app"></div>
+<div id="toasts"></div>
+
+<script type="module">
+import { auth, db } from './js/firebase-config.js';
+import { onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { collection, doc, getDocs, addDoc, updateDoc, query, where, orderBy, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-lite.js";
+import { renderSidebar } from './js/sidebar.js';
+import { toast, openModal, closeModal, ask } from './js/utils.js';
+import { ensureUserActive } from './js/access-control.js';
+import { ensureRoleAllowed } from './js/access-control.js';
+import { getEmpresaId } from './js/access-control.js';
+
+let proveedores = [], editId = null;
+let currentEmpresaId = null;
+
+onAuthStateChanged(auth, async user => {
+    if (!user) { window.location.href = 'login.html'; return; }
+    if (!(await ensureUserActive(auth, db, user))) return;
+    if (!(await ensureRoleAllowed(db, user, ['admin', 'operador']))) return;
+    currentEmpresaId = getEmpresaId() || user.uid;
+    renderApp();
+    document.getElementById('btn-logout').addEventListener('click', () => signOut(auth).then(() => location.href='login.html'));
+    document.getElementById('user-name').textContent = user.email;
+    document.getElementById('user-avatar').textContent = user.email[0].toUpperCase();
+    await cargar();
+});
+
+function renderApp() {
+    document.getElementById('app').innerHTML = `
+        ${renderSidebar('proveedores')}
+        <main class="main">
+            <header class="topbar">
+                <div style="display:flex;align-items:center;gap:10px">
+                    <button class="btn btn-ghost btn-sm btn-menu">☰</button>
+                    <span class="topbar-title">Proveedores</span>
+                </div>
+                <button class="btn btn-primary" id="btn-nuevo">+ Nuevo proveedor</button>
+            </header>
+            <div class="page">
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Listado de proveedores</h2>
+                        <input class="inp inp-search" id="busca" placeholder="Buscar por nombre, CUIT o contacto…" oninput="window.filtrar()">
+                    </div>
+                    <div class="table-wrap">
+                        <table>
+                            <thead><tr><th>Nombre</th><th>CUIT</th><th>Contacto</th><th>Email</th><th>Teléfono</th><th>Condiciones</th><th>Acciones</th></tr></thead>
+                            <tbody id="tbody"></tbody>
+                        </table>
+                    </div>
+                    <div class="pag"><span id="pag-info">—</span></div>
+                </div>
+            </div>
+        </main>
+
+        <div class="overlay" id="modal-prov">
+            <div class="modal">
+                <div class="modal-head">
+                    <h3 id="modal-title">Nuevo proveedor</h3>
+                    <button class="btn btn-ghost btn-sm" onclick="closeModal('modal-prov')">✕</button>
+                </div>
+                <div class="modal-body">
+                    <div class="form-grid">
+                        <div class="fgroup full"><label>Nombre / Razón social *</label><input class="inp" id="f-nombre" required></div>
+                        <div class="fgroup"><label>CUIT</label><input class="inp" id="f-cuit" placeholder="30-12345678-9"></div>
+                        <div class="fgroup"><label>Contacto</label><input class="inp" id="f-contacto" placeholder="Nombre de contacto"></div>
+                        <div class="fgroup"><label>Email</label><input class="inp" type="email" id="f-email"></div>
+                        <div class="fgroup"><label>Teléfono</label><input class="inp" id="f-tel"></div>
+                        <div class="fgroup full"><label>Dirección</label><input class="inp" id="f-dir"></div>
+                        <div class="fgroup full"><label>Condiciones de pago</label><input class="inp" id="f-cond" placeholder="Ej: 30 días, transferencia"></div>
+                        <div class="fgroup full"><label>Notas</label><textarea class="inp" id="f-notas"></textarea></div>
+                    </div>
+                </div>
+                <div class="modal-foot">
+                    <button class="btn btn-ghost" onclick="closeModal('modal-prov')">Cancelar</button>
+                    <button class="btn btn-primary" id="btn-guardar">Guardar</button>
+                </div>
+            </div>
+        </div>`;
+
+    document.getElementById('btn-nuevo').addEventListener('click', abrirNuevo);
+    document.getElementById('btn-guardar').addEventListener('click', guardar);
+    document.querySelector('.btn-menu').addEventListener('click', () => document.querySelector('.sidebar').classList.toggle('open'));
+}
+
+async function cargar() {
+    const snap = await getDocs(query(collection(db,'proveedores'), where('empresa_id','==',currentEmpresaId), where('activo','==',true)));
+    proveedores = snap.docs
+        .map(d => ({id:d.id,...d.data()}))
+        .sort((a,b) => (a.nombre||'').localeCompare((b.nombre||''), 'es', { sensitivity:'base' }));
+    filtrar();
+}
+
+window.filtrar = function() {
+    const busca = document.getElementById('busca').value.toLowerCase();
+    const lista = proveedores.filter(p => !busca || p.nombre?.toLowerCase().includes(busca) || p.cuit?.includes(busca) || p.contacto?.toLowerCase().includes(busca));
+    document.getElementById('pag-info').textContent = `${lista.length} proveedor${lista.length!==1?'es':''}`;
+    const tbody = document.getElementById('tbody');
+    if (!lista.length) {
+        tbody.innerHTML = `<tr><td colspan="7"><div class="empty"><div class="eicon">◫</div><p>No se encontraron proveedores</p></div></td></tr>`;
+        return;
+    }
+    tbody.innerHTML = lista.map(p => `<tr>
+        <td style="font-weight:500">${p.nombre}</td>
+        <td><span class="chip">${p.cuit||'—'}</span></td>
+        <td>${p.contacto||'<span style="color:var(--muted)">—</span>'}</td>
+        <td>${p.email||'<span style="color:var(--muted)">—</span>'}</td>
+        <td>${p.telefono||'<span style="color:var(--muted)">—</span>'}</td>
+        <td>${p.condiciones_pago||'<span style="color:var(--muted)">—</span>'}</td>
+        <td><div style="display:flex;gap:5px">
+            <button class="btn btn-ghost btn-sm" onclick="window.editar('${p.id}')">✎</button>
+            <button class="btn btn-danger btn-sm" onclick="window.eliminar('${p.id}','${(p.nombre||'').replace(/'/g,"\\'")}')">✕</button>
+        </div></td>
+    </tr>`).join('');
+};
+
+function abrirNuevo() {
+    editId = null;
+    document.getElementById('modal-title').textContent = 'Nuevo proveedor';
+    ['f-nombre','f-cuit','f-contacto','f-email','f-tel','f-dir','f-cond','f-notas'].forEach(id => document.getElementById(id).value='');
+    openModal('modal-prov');
+}
+
+window.editar = function(id) {
+    const p = proveedores.find(x=>x.id===id); if (!p) return;
+    editId = id;
+    document.getElementById('modal-title').textContent = 'Editar proveedor';
+    document.getElementById('f-nombre').value = p.nombre||'';
+    document.getElementById('f-cuit').value = p.cuit||'';
+    document.getElementById('f-contacto').value = p.contacto||'';
+    document.getElementById('f-email').value = p.email||'';
+    document.getElementById('f-tel').value = p.telefono||'';
+    document.getElementById('f-dir').value = p.direccion||'';
+    document.getElementById('f-cond').value = p.condiciones_pago||'';
+    document.getElementById('f-notas').value = p.notas||'';
+    openModal('modal-prov');
+};
+
+async function guardar() {
+    const nombre = document.getElementById('f-nombre').value.trim();
+    if (!nombre) { toast('El nombre es obligatorio','err'); return; }
+
+    const btn = document.getElementById('btn-guardar');
+    btn.disabled=true; btn.textContent='Guardando…';
+
+    const data = {
+        empresa_id: currentEmpresaId,
+        nombre,
+        cuit: document.getElementById('f-cuit').value.trim(),
+        contacto: document.getElementById('f-contacto').value.trim(),
+        email: document.getElementById('f-email').value.trim(),
+        telefono: document.getElementById('f-tel').value.trim(),
+        direccion: document.getElementById('f-dir').value.trim(),
+        condiciones_pago: document.getElementById('f-cond').value.trim(),
+        notas: document.getElementById('f-notas').value.trim(),
+        activo: true,
+        updated_at: serverTimestamp(),
+    };
+
+    try {
+        if (editId) {
+            await updateDoc(doc(db,'proveedores',editId), data);
+            toast('Proveedor actualizado');
+        } else {
+            data.created_at = serverTimestamp();
+            await addDoc(collection(db,'proveedores'), data);
+            toast('Proveedor creado');
+        }
+        closeModal('modal-prov');
+        await cargar();
+    } catch(e) {
+        toast('Error: '+e.message,'err');
+    } finally {
+        btn.disabled=false; btn.textContent='Guardar';
+    }
+}
+
+window.eliminar = async function(id, nombre) {
+    if (!ask(`¿Eliminar a "${nombre}"?`)) return;
+    await updateDoc(doc(db,'proveedores',id), {activo:false});
+    toast('Proveedor eliminado','wrn');
+    await cargar();
+};
+</script>
+</body>
+</html>

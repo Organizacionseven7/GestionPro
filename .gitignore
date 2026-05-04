@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Firebase
+.firebase/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Local business data / exports
+*.xls
+*.xlsx
+*.xlsm
+_tmp_*
+productos_carga_masiva_*.csv
+productos_carga_masiva_*.txt
+ARGSEGURIDAD SRL/
+ARGSEGURIDAD\ SRL/
+ARGSEGURIDAD\ SRL
+*.csv.tmp

@@ -1,0 +1,800 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reportes — GestiónPro</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="app"></div>
+<div id="toasts"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jspdf-autotable@3.8.2/dist/jspdf.plugin.autotable.min.js"></script>
+<script type="module">
+import { auth, db } from './js/firebase-config.js';
+import { onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { collection, getDocs, query, where, orderBy } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-lite.js";
+import { renderSidebar } from './js/sidebar.js';
+import { money, toast } from './js/utils.js';
+import { ensureUserActive } from './js/access-control.js';
+import { ensureRoleAllowed } from './js/access-control.js';
+import { getEmpresaId } from './js/access-control.js';
+
+let ventas = [];
+let facturasExport = [];
+let presupuestosExport = [];
+let chartLinea = null, chartMetodo = null, chartCanal = null;
+let logoWatermarkDataUrl = null;
+let currentEmpresaId = null;
+
+onAuthStateChanged(auth, async user => {
+    if (!user) { window.location.href='login.html'; return; }
+    if (!(await ensureUserActive(auth, db, user))) return;
+    if (!(await ensureRoleAllowed(db, user, ['admin', 'operador']))) return;
+    currentEmpresaId = getEmpresaId() || user.uid;
+    renderApp(user);
+    await cargarVentas();
+    await cargarArchivosGenerados();
+    actualizarReportes();
+});
+
+function renderApp(user) {
+    document.getElementById('app').innerHTML = `
+        ${renderSidebar('reportes')}
+        <main class="main">
+            <header class="topbar">
+                <div style="display:flex;align-items:center;gap:10px">
+                    <button class="btn btn-ghost btn-sm btn-menu">☰</button>
+                    <span class="topbar-title">Reportes</span>
+                </div>
+                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                    <button class="btn btn-ghost btn-sm" id="btn-export-all">⬇ Descargar archivos generados</button>
+                    <select class="inp" id="f-periodo" style="width:auto" onchange="window.actualizarReportes()">
+                        <option value="7">Últimos 7 días</option>
+                        <option value="30" selected>Últimos 30 días</option>
+                        <option value="90">Últimos 90 días</option>
+                        <option value="365">Último año</option>
+                    </select>
+                </div>
+            </header>
+
+            <div class="page">
+                <div class="stats-grid">
+                    <div class="stat-card c-accent"><div class="slabel">Ventas período</div><div class="sval" id="k-total">$0,00</div></div>
+                    <div class="stat-card c-ok"><div class="slabel">Tickets</div><div class="sval" id="k-tickets">0</div></div>
+                    <div class="stat-card c-warn"><div class="slabel">Ticket promedio</div><div class="sval" id="k-prom">$0,00</div></div>
+                </div>
+
+                <div style="display:grid;grid-template-columns:1.4fr .6fr;gap:14px;margin-bottom:14px">
+                    <div class="card">
+                        <div class="card-header"><h2>Ventas por día</h2></div>
+                        <div style="padding:12px"><canvas id="chart-linea" height="120"></canvas></div>
+                    </div>
+                    <div style="display:grid;grid-template-rows:1fr 1fr;gap:14px">
+                        <div class="card">
+                            <div class="card-header"><h2>Por método de pago</h2></div>
+                            <div style="padding:12px"><canvas id="chart-metodo" height="140"></canvas></div>
+                        </div>
+                        <div class="card">
+                            <div class="card-header"><h2>Por canal</h2></div>
+                            <div style="padding:12px"><canvas id="chart-canal" height="140"></canvas></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+                    <div class="card">
+                        <div class="card-header"><h2>Top 10 productos más vendidos</h2></div>
+                        <div class="table-wrap">
+                            <table>
+                                <thead><tr><th>#</th><th>Producto</th><th>Cantidad</th><th>Importe</th></tr></thead>
+                                <tbody id="top-productos"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div class="card-header"><h2>Top 10 mejores clientes</h2></div>
+                        <div class="table-wrap">
+                            <table>
+                                <thead><tr><th>#</th><th>Cliente</th><th>Tickets</th><th>Total</th></tr></thead>
+                                <tbody id="top-clientes"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px">
+                    <div class="card">
+                        <div class="card-header"><h2>Facturas generadas</h2></div>
+                        <div class="table-wrap">
+                            <table>
+                                <thead><tr><th>Número</th><th>Cliente</th><th>Fecha</th><th></th></tr></thead>
+                                <tbody id="lista-facturas-export"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div class="card-header"><h2>Presupuestos generados</h2></div>
+                        <div class="table-wrap">
+                            <table>
+                                <thead><tr><th>Número</th><th>Cliente</th><th>Fecha</th><th></th></tr></thead>
+                                <tbody id="lista-presupuestos-export"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>`;
+
+    document.querySelector('.btn-menu').addEventListener('click', ()=>document.querySelector('.sidebar').classList.toggle('open'));
+    document.getElementById('btn-export-all').addEventListener('click', descargarArchivosGenerados);
+    document.getElementById('app').addEventListener('click', (e) => {
+        const btn = e.target.closest('.btn-download-doc');
+        if (!btn) return;
+        descargarArchivoIndividual(btn.dataset.tipo, btn.dataset.id);
+    });
+    document.getElementById('btn-logout')?.addEventListener('click', async () => {
+        await signOut(auth);
+        window.location.href='login.html';
+    });
+    document.getElementById('user-name').textContent = user.email;
+    document.getElementById('user-avatar').textContent = user.email[0].toUpperCase();
+}
+
+async function cargarVentas() {
+    try {
+        const snap = await getDocs(query(collection(db,'ventas'), where('empresa_id','==',currentEmpresaId), orderBy('created_at','desc')));
+        ventas = snap.docs.map(d=>({id:d.id,...d.data()})).filter(v=>v.estado!=='anulada');
+    } catch (e) {
+        toast('Error cargando ventas para reportes', 'err');
+    }
+}
+
+async function cargarArchivosGenerados() {
+    try {
+        const [snapFacturas, snapPresupuestos] = await Promise.all([
+            getDocs(query(collection(db,'facturas'), where('empresa_id','==',currentEmpresaId))),
+            getDocs(query(collection(db,'presupuestos'), where('empresa_id','==',currentEmpresaId))),
+        ]);
+        facturasExport = snapFacturas.docs.map(d => ({ id:d.id, ...d.data() }));
+        presupuestosExport = snapPresupuestos.docs.map(d => ({ id:d.id, ...d.data() }));
+        renderListasDescargaIndividual();
+    } catch (e) {
+        toast('No se pudo cargar lista de archivos generados', 'err');
+    }
+}
+
+window.actualizarReportes = actualizarReportes;
+function actualizarReportes() {
+    const dias = parseInt(document.getElementById('f-periodo').value, 10);
+    const desde = new Date();
+    desde.setHours(0,0,0,0);
+    desde.setDate(desde.getDate() - (dias - 1));
+
+    const lista = ventas.filter(v => {
+        const fecha = getFechaVenta(v);
+        return fecha && fecha >= desde;
+    });
+
+    const total = lista.reduce((a,v)=>a+(v.total||0),0);
+    const tickets = lista.length;
+    document.getElementById('k-total').textContent = money(total);
+    document.getElementById('k-tickets').textContent = tickets;
+    document.getElementById('k-prom').textContent = money(tickets ? total/tickets : 0);
+
+    renderLinea(lista, desde, dias);
+    renderDoughnuts(lista);
+    renderTopProductos(lista);
+    renderTopClientes(lista);
+}
+
+function getFechaVenta(v) {
+    if (v.created_at?.toDate) {
+        const d = v.created_at.toDate();
+        d.setHours(0,0,0,0);
+        return d;
+    }
+    if (v.fecha) {
+        const d = new Date(v.fecha + 'T00:00:00');
+        if (!Number.isNaN(d.getTime())) return d;
+    }
+    return null;
+}
+
+function renderLinea(lista, desde, dias) {
+    const css = getComputedStyle(document.documentElement);
+    const accent = css.getPropertyValue('--accent').trim();
+    const muted = css.getPropertyValue('--muted').trim();
+    const accentDim = css.getPropertyValue('--accent-dim').trim();
+    const border = css.getPropertyValue('--border').trim();
+    const labels = [];
+    const values = [];
+    for (let i=0; i<dias; i++) {
+        const d = new Date(desde);
+        d.setDate(desde.getDate() + i);
+        const key = d.toISOString().split('T')[0];
+        labels.push(d.toLocaleDateString('es-AR', { day:'2-digit', month:'2-digit' }));
+        const tot = lista.filter(v => {
+            const fv = getFechaVenta(v);
+            return fv && fv.toISOString().split('T')[0] === key;
+        }).reduce((a,v)=>a+(v.total||0),0);
+        values.push(tot);
+    }
+
+    const ctx = document.getElementById('chart-linea');
+    if (chartLinea) chartLinea.destroy();
+    chartLinea = new Chart(ctx, {
+        type:'line',
+        data:{
+            labels,
+            datasets:[{
+                label:'Ventas',
+                data:values,
+                borderColor:accent,
+                backgroundColor:accentDim,
+                fill:true,
+                tension:.3,
+                pointRadius:2,
+            }]
+        },
+        options:{
+            plugins:{ legend:{ display:false } },
+            scales:{
+                y:{ ticks:{ color:muted }, grid:{ color:border } },
+                x:{ ticks:{ color:muted }, grid:{ color:border } }
+            }
+        }
+    });
+}
+
+function renderDoughnuts(lista) {
+    const css = getComputedStyle(document.documentElement);
+    const accent = css.getPropertyValue('--accent').trim();
+    const success = css.getPropertyValue('--success').trim();
+    const warning = css.getPropertyValue('--warning').trim();
+    const danger = css.getPropertyValue('--danger').trim();
+    const muted = css.getPropertyValue('--muted').trim();
+    const text = css.getPropertyValue('--text').trim();
+    const porMetodo = {};
+    const porCanal = {};
+
+    lista.forEach(v => {
+        porMetodo[v.metodo_pago || 'sin dato'] = (porMetodo[v.metodo_pago || 'sin dato'] || 0) + (v.total || 0);
+        porCanal[v.canal || 'sin dato'] = (porCanal[v.canal || 'sin dato'] || 0) + (v.total || 0);
+    });
+
+    const colores = [accent, success, warning, danger, muted, text];
+
+    const mCtx = document.getElementById('chart-metodo');
+    if (chartMetodo) chartMetodo.destroy();
+    chartMetodo = new Chart(mCtx, {
+        type:'doughnut',
+        data:{ labels:Object.keys(porMetodo), datasets:[{ data:Object.values(porMetodo), backgroundColor:colores }] },
+        options:{ plugins:{ legend:{ labels:{ color:text, boxWidth:10 } } } }
+    });
+
+    const cCtx = document.getElementById('chart-canal');
+    if (chartCanal) chartCanal.destroy();
+    chartCanal = new Chart(cCtx, {
+        type:'doughnut',
+        data:{ labels:Object.keys(porCanal), datasets:[{ data:Object.values(porCanal), backgroundColor:colores }] },
+        options:{ plugins:{ legend:{ labels:{ color:text, boxWidth:10 } } } }
+    });
+}
+
+function renderTopProductos(lista) {
+    const map = {};
+    lista.forEach(v => {
+        (v.items||[]).forEach(it => {
+            const key = it.prod_id || it.nombre || 'sin-id';
+            if (!map[key]) map[key] = { nombre: it.nombre || 'Producto', cantidad:0, total:0 };
+            map[key].cantidad += it.cantidad || 0;
+            map[key].total += it.subtotal || ((it.precio||0) * (it.cantidad||0));
+        });
+    });
+
+    const top = Object.values(map).sort((a,b)=>b.cantidad-a.cantidad).slice(0,10);
+    const tbody = document.getElementById('top-productos');
+    if (!top.length) {
+        tbody.innerHTML = `<tr><td colspan="4"><div class="empty"><p>Sin datos</p></div></td></tr>`;
+        return;
+    }
+    tbody.innerHTML = top.map((p,i)=>`<tr>
+        <td>${i+1}</td>
+        <td style="font-weight:500">${p.nombre}</td>
+        <td><span class="chip">${p.cantidad}</span></td>
+        <td style="font-family:'DM Mono',monospace">${money(p.total)}</td>
+    </tr>`).join('');
+}
+
+function renderTopClientes(lista) {
+    const map = {};
+    lista.forEach(v => {
+        const key = v.cliente_id || v.cliente_nombre || 'consumidor-final';
+        if (!map[key]) map[key] = { nombre: v.cliente_nombre || 'Consumidor final', tickets:0, total:0 };
+        map[key].tickets += 1;
+        map[key].total += v.total || 0;
+    });
+
+    const top = Object.values(map).sort((a,b)=>b.total-a.total).slice(0,10);
+    const tbody = document.getElementById('top-clientes');
+    if (!top.length) {
+        tbody.innerHTML = `<tr><td colspan="4"><div class="empty"><p>Sin datos</p></div></td></tr>`;
+        return;
+    }
+    tbody.innerHTML = top.map((c,i)=>`<tr>
+        <td>${i+1}</td>
+        <td style="font-weight:500">${c.nombre}</td>
+        <td><span class="chip">${c.tickets}</span></td>
+        <td style="font-family:'DM Mono',monospace">${money(c.total)}</td>
+    </tr>`).join('');
+}
+
+function formatFechaDoc(fechaLike) {
+    if (fechaLike?.toDate) return fechaLike.toDate().toLocaleDateString('es-AR');
+    if (typeof fechaLike === 'string') {
+        const d = new Date(fechaLike.includes('T') ? fechaLike : `${fechaLike}T00:00:00`);
+        if (!Number.isNaN(d.getTime())) return d.toLocaleDateString('es-AR');
+    }
+    return '—';
+}
+
+function renderListasDescargaIndividual() {
+    const tbodyFact = document.getElementById('lista-facturas-export');
+    const tbodyPres = document.getElementById('lista-presupuestos-export');
+    if (!tbodyFact || !tbodyPres) return;
+
+    const facturasOrdenadas = [...facturasExport].sort((a,b) => {
+        const af = a.fecha_emision || '';
+        const bf = b.fecha_emision || '';
+        return String(bf).localeCompare(String(af));
+    }).slice(0, 50);
+
+    const presupuestosOrdenados = [...presupuestosExport].sort((a,b) => {
+        const at = a.created_at?.toDate ? a.created_at.toDate().getTime() : 0;
+        const bt = b.created_at?.toDate ? b.created_at.toDate().getTime() : 0;
+        return bt - at;
+    }).slice(0, 50);
+
+    if (!facturasOrdenadas.length) {
+        tbodyFact.innerHTML = `<tr><td colspan="4"><div class="empty"><p>Sin facturas</p></div></td></tr>`;
+    } else {
+        tbodyFact.innerHTML = facturasOrdenadas.map(f => `
+            <tr>
+                <td>${esc(f.numero || f.id)}</td>
+                <td>${esc(f.cliente_nombre || 'Sin cliente')}</td>
+                <td>${esc(formatFechaDoc(f.fecha_emision))}</td>
+                <td style="text-align:right"><button class="btn btn-ghost btn-sm btn-download-doc" data-tipo="factura" data-id="${esc(f.id)}">Descargar</button></td>
+            </tr>
+        `).join('');
+    }
+
+    if (!presupuestosOrdenados.length) {
+        tbodyPres.innerHTML = `<tr><td colspan="4"><div class="empty"><p>Sin presupuestos</p></div></td></tr>`;
+    } else {
+        tbodyPres.innerHTML = presupuestosOrdenados.map(p => `
+            <tr>
+                <td>${esc(p.numero || p.id)}</td>
+                <td>${esc(p.cliente_nombre || 'Sin cliente')}</td>
+                <td>${esc(formatFechaDoc(p.created_at))}</td>
+                <td style="text-align:right"><button class="btn btn-ghost btn-sm btn-download-doc" data-tipo="presupuesto" data-id="${esc(p.id)}">Descargar</button></td>
+            </tr>
+        `).join('');
+    }
+}
+
+function sanitizeFileName(value, fallback) {
+    return (value || fallback || 'archivo').toString().replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+function descargarBlob(nombreArchivo, blob, mimeType='application/octet-stream') {
+    const outBlob = blob instanceof Blob ? blob : new Blob([blob], { type: mimeType });
+    const a = document.createElement('a');
+    const url = URL.createObjectURL(outBlob);
+    a.href = url;
+    a.download = nombreArchivo;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+}
+
+function getPdfCtor() {
+    return window.jspdf?.jsPDF || null;
+}
+
+async function getLogoWatermarkDataUrl() {
+    if (logoWatermarkDataUrl) return logoWatermarkDataUrl;
+    try {
+        const resp = await fetch('./assets/logo-watermark.png', { cache: 'force-cache' });
+        if (!resp.ok) return null;
+        const blob = await resp.blob();
+        const dataUrl = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
+        logoWatermarkDataUrl = typeof dataUrl === 'string' ? dataUrl : null;
+        return logoWatermarkDataUrl;
+    } catch {
+        return null;
+    }
+}
+
+async function dibujarMarcaDeAgua(doc) {
+    const logoData = await getLogoWatermarkDataUrl();
+    if (!logoData) return;
+
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const pageHeight = doc.internal.pageSize.getHeight();
+    const logoWidth = Math.min(pageWidth * 0.62, 340);
+    const logoHeight = logoWidth * 0.72;
+    const x = (pageWidth - logoWidth) / 2;
+    const y = (pageHeight - logoHeight) / 2;
+
+    if (typeof doc.setGState === 'function') {
+        doc.setGState(new doc.GState({ opacity: 0.1 }));
+        doc.addImage(logoData, 'PNG', x, y, logoWidth, logoHeight, undefined, 'FAST');
+        doc.setGState(new doc.GState({ opacity: 1 }));
+        return;
+    }
+
+    // Fallback when transparency is unavailable in the current jsPDF build.
+    doc.addImage(logoData, 'PNG', x, y, logoWidth, logoHeight, undefined, 'FAST');
+}
+
+async function crearBasePdf(titulo, numero, cliente, fecha, detalleLineas = []) {
+    const JsPdf = getPdfCtor();
+    if (!JsPdf) throw new Error('jsPDF no disponible');
+
+    const doc = new JsPdf({ unit: 'pt', format: 'a4' });
+    const pageWidth = doc.internal.pageSize.getWidth();
+
+    await dibujarMarcaDeAgua(doc);
+
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(14);
+    doc.text(EMPRESA_PRINT.nombre, 40, 42);
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(9);
+    doc.text(`${EMPRESA_PRINT.rubros}`, 40, 56);
+    doc.text(`${EMPRESA_PRINT.cuit} | ${EMPRESA_PRINT.iibb}`, 40, 68);
+    doc.text(`${EMPRESA_PRINT.direccion}`, pageWidth - 40, 42, { align: 'right' });
+    doc.text(`${EMPRESA_PRINT.telefono}`, pageWidth - 40, 54, { align: 'right' });
+    doc.text(`${EMPRESA_PRINT.email}`, pageWidth - 40, 66, { align: 'right' });
+
+    doc.setDrawColor(20, 20, 20);
+    doc.line(40, 78, pageWidth - 40, 78);
+
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(16);
+    doc.text(`${titulo} ${numero || ''}`.trim(), 40, 104);
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(10);
+    doc.text(`Cliente: ${cliente || 'Sin cliente'}`, 40, 122);
+    doc.text(`Fecha: ${fecha || '-'}`, pageWidth - 40, 122, { align: 'right' });
+
+    let y = 138;
+    detalleLineas.forEach(linea => {
+        doc.text(linea, 40, y);
+        y += 12;
+    });
+
+    return { doc, startY: y + 8 };
+}
+
+function escribirPieDocumento(doc) {
+    const pageCount = doc.internal.getNumberOfPages();
+    const pageHeight = doc.internal.pageSize.getHeight();
+    for (let i = 1; i <= pageCount; i++) {
+        doc.setPage(i);
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(8);
+        doc.setTextColor(80, 80, 80);
+        doc.text(`${EMPRESA_PRINT.nombre} - ${EMPRESA_PRINT.rubros}`, 40, pageHeight - 22);
+        doc.text('Documento generado por GestionPro', doc.internal.pageSize.getWidth() - 40, pageHeight - 22, { align: 'right' });
+    }
+    doc.setTextColor(0, 0, 0);
+}
+
+async function generarPdfFacturaArrayBuffer(f) {
+    const fecha = f.fecha_emision || new Date().toISOString().split('T')[0];
+    const subtotal = parseFloat(f.subtotal) || 0;
+    const iva = parseFloat(f.iva) || 0;
+    const total = parseFloat(f.total) || 0;
+    const items = (f.items || []).map(it => ({
+        codigo: it.codigo || '',
+        nombre: it.nombre || 'Item',
+        cantidad: parseFloat(it.cantidad) || 0,
+        precio: parseFloat(it.precio) || 0,
+    }));
+
+    const detalleFactura = [
+        `Tipo: ${f.tipo || 'B'}`,
+        `Estado: ${f.estado || 'pendiente'}`,
+        `Vencimiento: ${f.fecha_vencimiento || '-'}`,
+    ];
+    if (f.origen === 'presupuesto' && (f.presupuesto_numero || f.presupuesto_id)) {
+        detalleFactura.push(`Origen: ${f.presupuesto_numero || f.presupuesto_id}`);
+    }
+
+    const { doc, startY } = await crearBasePdf('Factura', f.numero || f.id, f.cliente_nombre, fecha, detalleFactura);
+
+    const body = items.length
+        ? items.map(it => [
+            `${it.nombre}${it.codigo ? ` [${it.codigo}]` : ''}`,
+            String(it.cantidad),
+            money(it.precio),
+            money((it.cantidad || 0) * (it.precio || 0)),
+        ])
+        : [['Sin items detallados', '-', '-', '-']];
+
+    doc.autoTable({
+        startY,
+        head: [['Descripcion', 'Cant.', 'Unit.', 'Subtotal']],
+        body,
+        styles: { fontSize: 9 },
+        headStyles: { fillColor: [240, 240, 240], textColor: [20, 20, 20] },
+        margin: { left: 40, right: 40 },
+    });
+
+    const y = (doc.lastAutoTable?.finalY || startY) + 18;
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(10);
+    doc.text(`Subtotal: ${money(subtotal)}`, 360, y);
+    doc.text(`IVA: ${money(iva)}`, 360, y + 14);
+    doc.setFont('helvetica', 'bold');
+    doc.text(`Total: ${money(total)}`, 360, y + 30);
+
+    if (f.notas) {
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(9);
+        doc.text(`Notas: ${String(f.notas)}`, 40, y + 54, { maxWidth: 500 });
+    }
+
+    escribirPieDocumento(doc);
+
+    return doc.output('arraybuffer');
+}
+
+async function generarPdfPresupuestoArrayBuffer(p) {
+    const fecha = p.created_at?.toDate ? p.created_at.toDate().toLocaleDateString('es-AR') : new Date().toLocaleDateString('es-AR');
+    const subtotal = parseFloat(p.subtotal) || 0;
+    const descuento = parseFloat(p.descuento) || 0;
+    const total = parseFloat(p.total) || 0;
+    const items = (p.items || []).map(it => ({
+        tipo: it.tipo || (it.prod_id ? 'producto' : 'servicio'),
+        codigo: it.codigo || '',
+        nombre: it.nombre || 'Item',
+        cantidad: parseFloat(it.cantidad) || 0,
+        precio: parseFloat(it.precio) || 0,
+        subtotal: parseFloat(it.subtotal) || ((parseFloat(it.cantidad) || 0) * (parseFloat(it.precio) || 0)),
+    }));
+
+    const { doc, startY } = await crearBasePdf('Presupuesto', p.numero || p.id, p.cliente_nombre, fecha, [
+        `Estado: ${p.estado || 'borrador'}`,
+        `Vencimiento: ${p.fecha_vencimiento || '-'}`,
+        'Valores expresados sin IVA',
+    ]);
+
+    const body = items.length
+        ? items.map(it => [
+            it.tipo === 'servicio' ? 'Servicio' : 'Producto',
+            `${it.nombre}${it.codigo ? ` [${it.codigo}]` : ''}`,
+            String(it.cantidad),
+            money(it.precio),
+            money(it.subtotal),
+        ])
+        : [['-', 'Sin items', '-', '-', '-']];
+
+    doc.autoTable({
+        startY,
+        head: [['Tipo', 'Item', 'Cant.', 'Unit.', 'Subtotal']],
+        body,
+        styles: { fontSize: 9 },
+        headStyles: { fillColor: [240, 240, 240], textColor: [20, 20, 20] },
+        margin: { left: 40, right: 40 },
+    });
+
+    const y = (doc.lastAutoTable?.finalY || startY) + 18;
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(10);
+    doc.text(`Subtotal: ${money(subtotal)}`, 360, y);
+    doc.text(`Descuento: -${money(descuento)}`, 360, y + 14);
+    doc.setFont('helvetica', 'bold');
+    doc.text(`Total (sin IVA): ${money(total)}`, 360, y + 30);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(9);
+    doc.text('Valores expresados sin IVA.', 40, y + 30);
+
+    if (p.notas) {
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(9);
+        doc.text(`Notas: ${String(p.notas)}`, 40, y + 48, { maxWidth: 500 });
+    }
+
+    escribirPieDocumento(doc);
+
+    return doc.output('arraybuffer');
+}
+
+async function descargarArchivoIndividual(tipo, id) {
+    if (!getPdfCtor()) { toast('No se pudo iniciar PDF (jsPDF no disponible)', 'err'); return; }
+    if (tipo === 'factura') {
+        const f = facturasExport.find(x => x.id === id);
+        if (!f) { toast('Factura no encontrada', 'err'); return; }
+        const nombre = sanitizeFileName(f.numero || f.id, 'factura');
+        const pdf = await generarPdfFacturaArrayBuffer(f);
+        descargarBlob(`${nombre}.pdf`, pdf, 'application/pdf');
+        toast(`Factura ${f.numero || f.id} descargada en PDF`);
+        return;
+    }
+    if (tipo === 'presupuesto') {
+        const p = presupuestosExport.find(x => x.id === id);
+        if (!p) { toast('Presupuesto no encontrado', 'err'); return; }
+        const nombre = sanitizeFileName(p.numero || p.id, 'presupuesto');
+        const pdf = await generarPdfPresupuestoArrayBuffer(p);
+        descargarBlob(`${nombre}.pdf`, pdf, 'application/pdf');
+        toast(`Presupuesto ${p.numero || p.id} descargado en PDF`);
+    }
+}
+
+function esc(str='') {
+    return String(str)
+        .replaceAll('&','&amp;')
+        .replaceAll('<','&lt;')
+        .replaceAll('>','&gt;')
+        .replaceAll('"','&quot;')
+        .replaceAll("'",'&#39;');
+}
+
+const EMPRESA_PRINT = {
+    nombre: 'Organizacion Seven',
+    rubros: 'Seguridad | Limpieza | Jardineria',
+    cuit: 'CUIT: 27-20107022-3',
+    iibb: 'IIBB: 159245/0',
+    direccion: 'Calle 11 N 1550 Oficina 14 - General Pico, La Pampa',
+    telefono: 'Cel: 02302597449 / 2302455262',
+    email: 'juliantoselli@organizacionseven.com',
+    web: 'organizacionseven.com',
+};
+
+function htmlPresupuesto(p) {
+    const items = (p.items||[]).map(it => ({
+        tipo: it.tipo || (it.prod_id ? 'producto' : 'servicio'),
+        nombre: it.nombre || 'Item',
+        cantidad: parseFloat(it.cantidad)||0,
+        precio: parseFloat(it.precio)||0,
+        subtotal: parseFloat(it.subtotal)||((parseFloat(it.cantidad)||0)*(parseFloat(it.precio)||0)),
+    }));
+    const productos = items.filter(i=>i.tipo==='producto');
+    const servicios = items.filter(i=>i.tipo==='servicio');
+    const rows = lista => lista.map(it => `<tr><td>${esc(it.nombre)}</td><td style="text-align:center">${it.cantidad}</td><td style="text-align:right">${money(it.precio)}</td><td style="text-align:right">${money(it.subtotal)}</td></tr>`).join('');
+    const bloque = (titulo, lista) => !lista.length ? '' : `
+        <h3>${titulo}</h3>
+        <table>
+            <thead><tr><th style="text-align:left">Descripcion</th><th>Cant.</th><th style="text-align:right">Unit.</th><th style="text-align:right">Subtotal</th></tr></thead>
+            <tbody>${rows(lista)}</tbody>
+        </table>
+    `;
+    const fecha = p.created_at?.toDate ? p.created_at.toDate().toLocaleDateString('es-AR') : new Date().toLocaleDateString('es-AR');
+    const subtotal = parseFloat(p.subtotal)||0;
+    const descuento = parseFloat(p.descuento)||0;
+    const total = parseFloat(p.total)||0;
+    return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Presupuesto ${esc(p.numero||'')}</title>
+    <style>
+    body{font-family:Arial,sans-serif;color:#111;padding:24px}.print-head{display:grid;grid-template-columns:1fr 1fr;gap:16px;border-bottom:2px solid #111;padding-bottom:10px;margin-bottom:12px}
+    .print-head h4{margin:0 0 6px 0;font-size:17px}.print-head .line{font-size:11px;color:#333;line-height:1.35}.mut{color:#555;font-size:12px}.head{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;border-bottom:1px solid #ddd;padding-bottom:14px;margin-bottom:12px}
+    table{width:100%;border-collapse:collapse;margin-bottom:10px}th,td{padding:8px 6px;border-bottom:1px solid #e5e5e5;font-size:12px}th{background:#f5f5f5}.tot{margin-top:12px;max-width:320px;margin-left:auto}.tot .r{display:flex;justify-content:space-between;padding:4px 0;font-size:13px}.tot .t{border-top:1px solid #111;padding-top:7px;margin-top:4px;font-size:18px;font-weight:700}
+    .notes{margin-top:18px;padding:10px;border:1px solid #ddd;background:#fafafa;font-size:12px}.print-foot{margin-top:18px;border-top:1px solid #ccc;padding-top:8px;font-size:10px;color:#444;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+    </style></head><body>
+    <div class="print-head"><div><h4>${esc(EMPRESA_PRINT.nombre)}</h4><div class="line">${esc(EMPRESA_PRINT.rubros)}</div><div class="line">${esc(EMPRESA_PRINT.cuit)} | ${esc(EMPRESA_PRINT.iibb)}</div></div><div style="text-align:right"><div class="line">${esc(EMPRESA_PRINT.direccion)}</div><div class="line">${esc(EMPRESA_PRINT.telefono)}</div><div class="line">${esc(EMPRESA_PRINT.email)}</div><div class="line">${esc(EMPRESA_PRINT.web)}</div></div></div>
+    <div class="head"><div><h1>Presupuesto ${esc(p.numero||'')}</h1><div class="mut">Fecha: ${esc(fecha)}</div><div class="mut">Estado: ${esc(p.estado||'borrador')}</div><div class="mut">Vencimiento: ${esc(p.fecha_vencimiento||'—')}</div></div><div style="text-align:right"><h2 style="margin:0">GestiónPro</h2><div class="mut">Cliente: ${esc(p.cliente_nombre||'Sin cliente')}</div></div></div>
+    ${bloque('Productos', productos)}
+    ${bloque('Servicios', servicios)}
+    <div class="tot"><div class="r"><span>Subtotal</span><span>${money(subtotal)}</span></div><div class="r"><span>Descuento</span><span>-${money(descuento)}</span></div><div class="r t"><span>Total (sin IVA)</span><span>${money(total)}</span></div></div>
+    <div style="margin-top:10px;font-size:11px;color:#333;font-weight:700">Valores expresados sin IVA.</div>
+    ${p.notas ? `<div class="notes"><strong>Notas:</strong><br>${esc(p.notas)}</div>` : ''}
+    <div class="print-foot"><span>${esc(EMPRESA_PRINT.nombre)} - ${esc(EMPRESA_PRINT.rubros)}</span><span>Documento generado por GestionPro</span></div>
+    </body></html>`;
+}
+
+function htmlFactura(f) {
+    const listaItems = (f.items || []).map(it => ({
+        nombre: it.nombre || 'Item',
+        cantidad: parseFloat(it.cantidad)||0,
+        precio: parseFloat(it.precio)||0,
+    }));
+    const rows = listaItems.length
+        ? listaItems.map(it => `<tr><td>${esc(it.nombre)}</td><td style="text-align:center">${it.cantidad}</td><td style="text-align:right">${money(it.precio)}</td><td style="text-align:right">${money((it.cantidad||0)*(it.precio||0))}</td></tr>`).join('')
+        : `<tr><td colspan="4" style="text-align:center;color:#555">Sin items detallados</td></tr>`;
+    const fecha = f.fecha_emision || new Date().toISOString().split('T')[0];
+    const subtotal = parseFloat(f.subtotal)||0;
+    const iva = parseFloat(f.iva)||0;
+    const total = parseFloat(f.total)||0;
+    return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Factura ${esc(f.numero||'')}</title>
+    <style>
+    body{font-family:Arial,sans-serif;color:#111;padding:24px}.print-head{display:grid;grid-template-columns:1fr 1fr;gap:16px;border-bottom:2px solid #111;padding-bottom:10px;margin-bottom:12px}
+    .print-head h4{margin:0 0 6px 0;font-size:17px}.print-head .line{font-size:11px;color:#333;line-height:1.35}.mut{color:#555;font-size:12px}.head{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;border-bottom:1px solid #ddd;padding-bottom:14px;margin-bottom:12px}
+    table{width:100%;border-collapse:collapse;margin-bottom:10px}th,td{padding:8px 6px;border-bottom:1px solid #e5e5e5;font-size:12px}th{background:#f5f5f5}.tot{margin-top:12px;max-width:320px;margin-left:auto}.tot .r{display:flex;justify-content:space-between;padding:4px 0;font-size:13px}.tot .t{border-top:1px solid #111;padding-top:7px;margin-top:4px;font-size:18px;font-weight:700}
+    .notes{margin-top:18px;padding:10px;border:1px solid #ddd;background:#fafafa;font-size:12px}.print-foot{margin-top:18px;border-top:1px solid #ccc;padding-top:8px;font-size:10px;color:#444;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+    </style></head><body>
+    <div class="print-head"><div><h4>${esc(EMPRESA_PRINT.nombre)}</h4><div class="line">${esc(EMPRESA_PRINT.rubros)}</div><div class="line">${esc(EMPRESA_PRINT.cuit)} | ${esc(EMPRESA_PRINT.iibb)}</div></div><div style="text-align:right"><div class="line">${esc(EMPRESA_PRINT.direccion)}</div><div class="line">${esc(EMPRESA_PRINT.telefono)}</div><div class="line">${esc(EMPRESA_PRINT.email)}</div><div class="line">${esc(EMPRESA_PRINT.web)}</div></div></div>
+    <div class="head"><div><h1>Factura ${esc(f.numero||'')}</h1><div class="mut">Tipo: ${esc(f.tipo||'B')}</div><div class="mut">Fecha emision: ${esc(fecha)}</div><div class="mut">Vencimiento: ${esc(f.fecha_vencimiento||'—')}</div><div class="mut">Estado: ${esc(f.estado||'pendiente')}</div></div><div style="text-align:right"><h2 style="margin:0">GestiónPro</h2><div class="mut">Cliente: ${esc(f.cliente_nombre||'Sin cliente')}</div></div></div>
+    <table><thead><tr><th style="text-align:left">Descripcion</th><th>Cant.</th><th style="text-align:right">Unit.</th><th style="text-align:right">Subtotal</th></tr></thead><tbody>${rows}</tbody></table>
+    <div class="tot"><div class="r"><span>Subtotal</span><span>${money(subtotal)}</span></div><div class="r"><span>IVA</span><span>${money(iva)}</span></div><div class="r t"><span>Total</span><span>${money(total)}</span></div></div>
+    ${f.notas ? `<div class="notes"><strong>Notas:</strong><br>${esc(f.notas)}</div>` : ''}
+    <div class="print-foot"><span>${esc(EMPRESA_PRINT.nombre)} - ${esc(EMPRESA_PRINT.rubros)}</span><span>Documento generado por GestionPro</span></div>
+    </body></html>`;
+}
+
+async function descargarArchivosGenerados() {
+    const btn = document.getElementById('btn-export-all');
+    if (!window.JSZip) { toast('No se pudo iniciar exportación (JSZip no disponible)', 'err'); return; }
+    if (!getPdfCtor()) { toast('No se pudo iniciar exportación PDF (jsPDF no disponible)', 'err'); return; }
+    btn.disabled = true;
+    const oldText = btn.textContent;
+    btn.textContent = 'Generando ZIP…';
+
+    try {
+        if (!facturasExport.length && !presupuestosExport.length) {
+            await cargarArchivosGenerados();
+        }
+        const facturas = facturasExport;
+        const presupuestos = presupuestosExport;
+
+        const zip = new window.JSZip();
+        const carpetaFact = zip.folder('facturas');
+        const carpetaPres = zip.folder('presupuestos');
+
+        zip.file('facturas.json', JSON.stringify(facturas, null, 2));
+        zip.file('presupuestos.json', JSON.stringify(presupuestos, null, 2));
+
+        for (const f of facturas) {
+            const num = sanitizeFileName(f.numero || f.id, 'factura');
+            carpetaFact.file(`${num}.pdf`, await generarPdfFacturaArrayBuffer(f));
+        }
+        for (const p of presupuestos) {
+            const num = sanitizeFileName(p.numero || p.id, 'presupuesto');
+            carpetaPres.file(`${num}.pdf`, await generarPdfPresupuestoArrayBuffer(p));
+        }
+
+        zip.file('README.txt', [
+            'Exportacion de archivos generados - GestionPro',
+            `Fecha: ${new Date().toLocaleString('es-AR')}`,
+            `Facturas: ${facturas.length}`,
+            `Presupuestos: ${presupuestos.length}`,
+            '',
+            'Contenido:',
+            '- facturas.json y presupuestos.json (datos crudos)',
+            '- carpeta facturas/*.pdf',
+            '- carpeta presupuestos/*.pdf'
+        ].join('\n'));
+
+        const blob = await zip.generateAsync({ type: 'blob' });
+        const a = document.createElement('a');
+        const url = URL.createObjectURL(blob);
+        a.href = url;
+        a.download = `gestionpro-archivos-generados-${new Date().toISOString().slice(0,10)}.zip`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        toast(`Descarga generada: ${facturas.length} facturas y ${presupuestos.length} presupuestos`);
+    } catch (e) {
+        toast('No se pudo generar la descarga: ' + e.message, 'err');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = oldText;
+    }
+}
+</script>
+</body>
+</html>

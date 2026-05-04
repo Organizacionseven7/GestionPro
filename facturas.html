@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Facturas — GestiónPro</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="app"></div>
+<div id="toasts"></div>
+
+<script type="module">
+import { auth, db } from './js/firebase-config.js';
+import { onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { collection, doc, getDocs, addDoc, updateDoc, query, where, orderBy, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-lite.js";
+import { renderSidebar } from './js/sidebar.js';
+import { toast, openModal, closeModal, money, genId, ask } from './js/utils.js';
+import { ensureUserActive } from './js/access-control.js';
+import { ensureRoleAllowed } from './js/access-control.js';
+import { getEmpresaId } from './js/access-control.js';
+
+let facturas=[], clientes=[], productos=[], items=[], editId=null;
+let facturaResaltadaId = null;
+let currentEmpresaId = null;
+
+onAuthStateChanged(auth, async user => {
+    if (!user) { window.location.href='login.html'; return; }
+    if (!(await ensureUserActive(auth, db, user))) return;
+    if (!(await ensureRoleAllowed(db, user, ['admin', 'ventas']))) return;
+    currentEmpresaId = getEmpresaId() || user.uid;
+    renderApp();
+    document.getElementById('btn-logout').addEventListener('click', ()=>signOut(auth).then(()=>location.href='login.html'));
+    document.getElementById('user-name').textContent=user.email;
+    document.getElementById('user-avatar').textContent=user.email[0].toUpperCase();
+    await Promise.all([cargarClientes(), cargarProductos()]);
+    await cargar();
+    aplicarFocoFactura();
+});
+
+function aplicarFocoFactura() {
+    const focusId = localStorage.getItem('focus_factura_id');
+    const focusNum = localStorage.getItem('focus_factura_numero');
+    if (!focusId && !focusNum) return;
+
+    const f = facturas.find(x => x.id === focusId) || facturas.find(x => (x.numero||'') === focusNum);
+    if (f) {
+        facturaResaltadaId = f.id;
+        const busca = document.getElementById('busca');
+        const festado = document.getElementById('festado');
+        if (festado) festado.value = '';
+        if (busca) {
+            busca.value = f.numero || f.id;
+            window.filtrar();
+            toast(`Mostrando factura vinculada: ${f.numero || f.id}`);
+        }
+    }
+
+    localStorage.removeItem('focus_factura_id');
+    localStorage.removeItem('focus_factura_numero');
+}
+
+function renderApp() {
+    document.getElementById('app').innerHTML = `
+        ${renderSidebar('facturas')}
+        <main class="main">
+            <header class="topbar">
+                <div style="display:flex;align-items:center;gap:10px">
+                    <button class="btn btn-ghost btn-sm btn-menu">☰</button>
+                    <span class="topbar-title">Facturas</span>
+                </div>
+                <button class="btn btn-primary" id="btn-nuevo">+ Nueva factura</button>
+            </header>
+            <div class="page">
+                <div class="stats-grid">
+                    <div class="stat-card c-warn"><div class="slabel">Pendientes</div><div class="sval" id="s-pend">—</div></div>
+                    <div class="stat-card c-ok"><div class="slabel">Pagadas</div><div class="sval" id="s-pag">—</div></div>
+                    <div class="stat-card c-danger"><div class="slabel">Vencidas</div><div class="sval" id="s-venc">—</div></div>
+                    <div class="stat-card c-accent"><div class="slabel">Total pendiente</div><div class="sval" style="font-size:18px" id="s-monto">—</div></div>
+                </div>
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Listado de facturas</h2>
+                        <div style="display:flex;gap:8px">
+                            <input class="inp inp-search" id="busca" placeholder="Buscar…" oninput="window.filtrar()">
+                            <select class="inp" id="festado" onchange="window.filtrar()" style="width:auto">
+                                <option value="">Todos</option>
+                                <option value="pendiente">Pendientes</option>
+                                <option value="pagada">Pagadas</option>
+                                <option value="vencida">Vencidas</option>
+                                <option value="anulada">Anuladas</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="table-wrap">
+                        <table>
+                            <thead><tr><th>Número</th><th>Tipo</th><th>Cliente</th><th>Emisión</th><th>Vencimiento</th><th>Total</th><th>Origen</th><th>Estado</th><th>Acciones</th></tr></thead>
+                            <tbody id="tbody"></tbody>
+                        </table>
+                    </div>
+                    <div class="pag"><span id="pag-info">—</span></div>
+                </div>
+            </div>
+        </main>
+
+        <!-- MODAL FACTURA -->
+        <div class="overlay" id="modal-fact">
+            <div class="modal">
+                <div class="modal-head">
+                    <h3 id="modal-title">Nueva factura</h3>
+                    <button class="btn btn-ghost btn-sm" onclick="closeModal('modal-fact')">✕</button>
+                </div>
+                <div class="modal-body">
+                    <div class="form-grid">
+                        <div class="fgroup"><label>Número</label><input class="inp" id="f-num" placeholder="Auto"></div>
+                        <div class="fgroup"><label>Tipo</label>
+                            <select class="inp" id="f-tipo"><option value="B">B</option><option value="A">A</option><option value="C">C</option><option value="X">X (interna)</option></select>
+                        </div>
+                        <div class="fgroup full"><label>Cliente</label>
+                            <select class="inp" id="f-cli"><option value="">Sin cliente</option></select>
+                        </div>
+
+                        <div class="fgroup full" style="margin-top:4px">
+                            <label>Ítems de factura</label>
+                            <div style="display:grid;grid-template-columns:1fr 80px auto;gap:8px;margin-bottom:8px">
+                                <select class="inp" id="f-prod-sel"><option value="">— Seleccionar producto —</option></select>
+                                <input class="inp" id="f-prod-cant" type="number" min="1" value="1">
+                                <button class="btn btn-ghost" type="button" id="btn-add-item">+ Producto</button>
+                            </div>
+                            <div style="display:grid;grid-template-columns:1fr 120px auto;gap:8px;margin-bottom:8px">
+                                <input class="inp" id="f-serv-desc" placeholder="Servicio / concepto manual">
+                                <input class="inp" id="f-serv-precio" type="number" min="0" step="0.01" placeholder="Precio">
+                                <button class="btn btn-ghost" type="button" id="btn-add-serv">+ Servicio</button>
+                            </div>
+                            <div class="item-row header" style="padding:0 4px">
+                                <div>Ítem</div><div>Cant.</div><div>Precio unit.</div><div>Subtotal</div><div></div>
+                            </div>
+                            <div id="f-items"></div>
+                        </div>
+
+                        <div class="fgroup"><label>Fecha emisión</label><input class="inp" type="date" id="f-emision"></div>
+                        <div class="fgroup"><label>Fecha vencimiento *</label><input class="inp" type="date" id="f-venc" required></div>
+                        <div class="fgroup"><label>Subtotal</label><input class="inp" type="number" id="f-sub" min="0" step="0.01" value="0" readonly></div>
+                        <div class="fgroup"><label>IVA (21%)</label><input class="inp" type="number" id="f-iva" min="0" step="0.01" value="0" oninput="calcTotal()"></div>
+                        <div class="fgroup"><label>Total</label><input class="inp" type="number" id="f-total" min="0" step="0.01" value="0" style="font-weight:700" readonly></div>
+                        <div class="fgroup full"><label>Notas</label><textarea class="inp" id="f-notas" placeholder="Notas, condiciones de pago…"></textarea></div>
+                    </div>
+                </div>
+                <div class="modal-foot">
+                    <button class="btn btn-ghost" onclick="closeModal('modal-fact')">Cancelar</button>
+                    <button class="btn btn-primary" id="btn-guardar">Guardar factura</button>
+                </div>
+            </div>
+        </div>`;
+
+    document.getElementById('btn-nuevo').addEventListener('click', abrirNuevo);
+    document.getElementById('btn-guardar').addEventListener('click', guardar);
+    document.getElementById('btn-add-item').addEventListener('click', agregarItemProducto);
+    document.getElementById('btn-add-serv').addEventListener('click', agregarItemServicio);
+    document.querySelector('.btn-menu').addEventListener('click', ()=>document.querySelector('.sidebar').classList.toggle('open'));
+}
+
+window.calcIVA  = function() {
+    const sub = parseFloat(document.getElementById('f-sub').value)||0;
+    document.getElementById('f-iva').value   = (sub*0.21).toFixed(2);
+    document.getElementById('f-total').value = (sub*1.21).toFixed(2);
+};
+window.calcTotal = function() {
+    const sub = parseFloat(document.getElementById('f-sub').value)||0;
+    const iva = parseFloat(document.getElementById('f-iva').value)||0;
+    document.getElementById('f-total').value = (sub+iva).toFixed(2);
+};
+
+function esc(str='') {
+    return String(str)
+        .replaceAll('&','&amp;')
+        .replaceAll('<','&lt;')
+        .replaceAll('>','&gt;')
+        .replaceAll('"','&quot;')
+        .replaceAll("'",'&#39;');
+}
+
+const EMPRESA_PRINT = {
+    nombre: 'Organizacion Seven',
+    rubros: 'Seguridad | Limpieza | Jardineria',
+    cuit: 'CUIT: 27-20107022-3',
+    iibb: 'IIBB: 159245/0',
+    direccion: 'Calle 11 N 1550 Oficina 14 - General Pico, La Pampa',
+    telefono: 'Cel: 02302597449 / 2302455262',
+    email: 'juliantoselli@organizacionseven.com',
+    web: 'organizacionseven.com',
+};
+
+async function cargarClientes() {
+    const snap = await getDocs(query(collection(db,'clientes'), where('empresa_id','==',currentEmpresaId), where('activo','==',true)));
+    clientes = snap.docs
+        .map(d=>({id:d.id,...d.data()}))
+        .sort((a,b) => (a.nombre||'').localeCompare((b.nombre||''), 'es', { sensitivity:'base' }));
+    const sel = document.getElementById('f-cli');
+    clientes.forEach(c=>sel.innerHTML+=`<option value="${c.id}">${c.nombre}</option>`);
+}
+
+async function cargarProductos() {
+    const snap = await getDocs(query(collection(db,'productos'), where('empresa_id','==',currentEmpresaId), where('activo','==',true)));
+    productos = snap.docs
+        .map(d=>({id:d.id,...d.data()}))
+        .sort((a,b) => (a.nombre||'').localeCompare((b.nombre||''), 'es', { sensitivity:'base' }));
+    const sel = document.getElementById('f-prod-sel');
+    if (!sel) return;
+    sel.innerHTML = '<option value="">— Seleccionar producto —</option>';
+    productos.forEach(p => {
+        const codigo = p.codigo ? ` [${esc(p.codigo)}]` : '';
+        sel.innerHTML += `<option value="${p.id}">${p.nombre}${codigo} — ${money(p.precio_venta||0)}</option>`;
+    });
+}
+
+function renderItemsFactura() {
+    const cont = document.getElementById('f-items');
+    if (!cont) return;
+    if (!items.length) {
+        cont.innerHTML = `<div style="font-size:12px;color:var(--muted);padding:6px 4px">Sin ítems cargados</div>`;
+        recalcularDesdeItems();
+        return;
+    }
+    cont.innerHTML = items.map((it, i) => `
+        <div class="item-row" style="padding:2px 4px">
+            <div>
+                <div style="font-weight:500">${it.nombre}</div>
+                <div style="font-size:11px;color:var(--muted)">${it.tipo || 'item'}${it.codigo ? ` • [${it.codigo}]` : ''}</div>
+            </div>
+            <input class="inp btn-sm" type="number" min="1" value="${it.cantidad}" style="padding:4px 6px" onchange="window.updItemFactura(${i},'cantidad',this.value)">
+            <input class="inp btn-sm" type="number" min="0" step="0.01" value="${it.precio}" style="padding:4px 6px" onchange="window.updItemFactura(${i},'precio',this.value)">
+            <div style="font-family:'DM Mono',monospace;font-weight:600">${money((it.cantidad||0)*(it.precio||0))}</div>
+            <button class="btn btn-danger btn-sm" style="padding:4px 8px" onclick="window.removeItemFactura(${i})">✕</button>
+        </div>
+    `).join('');
+    recalcularDesdeItems();
+}
+
+function recalcularDesdeItems() {
+    const sub = items.reduce((a,it)=>a+((parseFloat(it.cantidad)||0)*(parseFloat(it.precio)||0)),0);
+    document.getElementById('f-sub').value = sub.toFixed(2);
+    window.calcIVA();
+}
+
+function agregarItemProducto() {
+    const sel = document.getElementById('f-prod-sel');
+    const cant = parseInt(document.getElementById('f-prod-cant').value,10) || 1;
+    const id = sel.value;
+    const p = productos.find(x=>x.id===id);
+    if (!p) { toast('Seleccioná un producto','err'); return; }
+    items.push({
+        tipo: 'producto',
+        prod_id: p.id,
+        codigo: p.codigo || '',
+        nombre: p.nombre || 'Producto',
+        cantidad: cant > 0 ? cant : 1,
+        precio: parseFloat(p.precio_venta)||0,
+    });
+    document.getElementById('f-prod-cant').value = '1';
+    sel.value = '';
+    renderItemsFactura();
+}
+
+function agregarItemServicio() {
+    const nombre = (document.getElementById('f-serv-desc').value||'').trim();
+    const precio = parseFloat(document.getElementById('f-serv-precio').value)||0;
+    if (!nombre || precio <= 0) { toast('Completá servicio y precio','err'); return; }
+    items.push({ tipo:'servicio', prod_id:null, nombre, cantidad:1, precio });
+    document.getElementById('f-serv-desc').value = '';
+    document.getElementById('f-serv-precio').value = '';
+    renderItemsFactura();
+}
+
+window.updItemFactura = function(i, campo, val) {
+    const it = items[i];
+    if (!it) return;
+    if (campo === 'cantidad') it.cantidad = Math.max(1, parseInt(val,10) || 1);
+    if (campo === 'precio') it.precio = Math.max(0, parseFloat(val) || 0);
+    renderItemsFactura();
+};
+
+window.removeItemFactura = function(i) {
+    items.splice(i,1);
+    renderItemsFactura();
+};
+
+async function cargar() {
+    const snap = await getDocs(query(collection(db,'facturas'), where('empresa_id','==',currentEmpresaId), orderBy('created_at','desc')));
+    facturas = snap.docs.map(d=>({id:d.id,...d.data()}));
+    // Stats
+    const hoy = new Date();
+    let pend=0, pag=0, venc=0, montoPend=0;
+    facturas.forEach(f => {
+        const fvenc = f.fecha_vencimiento ? new Date(f.fecha_vencimiento) : null;
+        if (f.estado==='pendiente') {
+            if (fvenc && fvenc < hoy) venc++;
+            else pend++;
+            montoPend += f.total||0;
+        }
+        if (f.estado==='pagada') pag++;
+    });
+    document.getElementById('s-pend').textContent  = pend;
+    document.getElementById('s-pag').textContent   = pag;
+    document.getElementById('s-venc').textContent  = venc;
+    document.getElementById('s-monto').textContent = money(montoPend);
+    filtrar();
+}
+
+const badgeE = { pendiente:'b-warn', pagada:'b-ok', vencida:'b-danger', anulada:'b-gray' };
+
+window.filtrar = function() {
+    const busca  = document.getElementById('busca').value.toLowerCase();
+    const estado = document.getElementById('festado').value;
+    const lista  = facturas.filter(f => {
+        const ok1 = !busca || f.numero?.toLowerCase().includes(busca) || f.cliente_nombre?.toLowerCase().includes(busca);
+        const ok2 = !estado || f.estado === estado;
+        return ok1 && ok2;
+    });
+    document.getElementById('pag-info').textContent = `${lista.length} factura${lista.length!==1?'s':''}`;
+    const tbody = document.getElementById('tbody');
+    if (!lista.length) {
+        tbody.innerHTML = `<tr><td colspan="9"><div class="empty"><div class="eicon">▣</div><p>No hay facturas</p></div></td></tr>`;
+        return;
+    }
+    const hoy = new Date();
+    tbody.innerHTML = lista.map(f => {
+        const fvenc = f.fecha_vencimiento ? new Date(f.fecha_vencimiento) : null;
+        const vencida = fvenc && fvenc < hoy && f.estado==='pendiente';
+        const estBadge = vencida ? 'b-danger' : badgeE[f.estado]||'b-gray';
+        const estLabel = vencida ? 'Vencida' : f.estado;
+        return `<tr data-id="${f.id}">
+            <td><span class="chip">${f.numero||f.id.slice(0,8)}</span></td>
+            <td><span class="badge b-info">${f.tipo||'B'}</span></td>
+            <td style="font-weight:500">${f.cliente_nombre||'<span style="color:var(--muted)">—</span>'}</td>
+            <td style="color:var(--muted)">${f.fecha_emision||'—'}</td>
+            <td style="color:${vencida?'var(--danger)':'var(--text)'}">${f.fecha_vencimiento||'—'}</td>
+            <td style="font-family:'DM Mono',monospace;font-weight:600">${money(f.total)}</td>
+            <td>
+                ${f.origen==='presupuesto'
+                    ? `<span class="chip" title="${f.presupuesto_numero||f.presupuesto_id||'Presupuesto'}">${f.presupuesto_numero||'Presupuesto'}</span>`
+                    : '<span style="color:var(--muted)">—</span>'}
+            </td>
+            <td><span class="badge ${estBadge}">${estLabel}</span></td>
+            <td>
+                <div style="display:flex;gap:5px">
+                    <button class="btn btn-ghost btn-sm" onclick="window.imprimirFactura('${f.id}')">🖨</button>
+                    ${f.origen==='presupuesto' ? `<button class="btn btn-ghost btn-sm" onclick="window.irAPresupuesto('${f.presupuesto_id||''}')">↗ Pres</button>` : ''}
+                    ${f.estado==='pendiente'?`<button class="btn btn-success btn-sm" onclick="window.marcarPagada('${f.id}')">✓ Cobrar</button>`:''}
+                    <button class="btn btn-danger btn-sm" onclick="window.anular('${f.id}')">✕</button>
+                </div>
+            </td>
+        </tr>`;
+    }).join('');
+
+    if (facturaResaltadaId) {
+        const row = tbody.querySelector(`tr[data-id="${facturaResaltadaId}"]`);
+        if (row) {
+            row.classList.add('row-focus');
+            row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            setTimeout(() => row.classList.remove('row-focus'), 2200);
+            facturaResaltadaId = null;
+        }
+    }
+};
+
+function abrirNuevo() {
+    editId=null;
+    items=[];
+    document.getElementById('modal-title').textContent='Nueva factura';
+    document.getElementById('f-num').value   = genId('FAC');
+    document.getElementById('f-tipo').value  = 'B';
+    document.getElementById('f-cli').value   = '';
+    document.getElementById('f-emision').value = new Date().toISOString().split('T')[0];
+    document.getElementById('f-venc').value  = '';
+    document.getElementById('f-sub').value   = '0';
+    document.getElementById('f-iva').value   = '0';
+    document.getElementById('f-total').value = '0';
+    document.getElementById('f-notas').value = '';
+    document.getElementById('f-prod-sel').value = '';
+    document.getElementById('f-prod-cant').value = '1';
+    document.getElementById('f-serv-desc').value = '';
+    document.getElementById('f-serv-precio').value = '';
+    renderItemsFactura();
+    openModal('modal-fact');
+}
+
+async function guardar() {
+    const venc = document.getElementById('f-venc').value;
+    if (!venc) { toast('La fecha de vencimiento es obligatoria','err'); return; }
+    const btn = document.getElementById('btn-guardar');
+    btn.disabled=true; btn.textContent='Guardando…';
+    const cliId = document.getElementById('f-cli').value;
+    const cli   = clientes.find(c=>c.id===cliId);
+    const data  = {
+        empresa_id:       currentEmpresaId,
+        numero:           document.getElementById('f-num').value.trim(),
+        tipo:             document.getElementById('f-tipo').value,
+        cliente_id:       cliId||null,
+        cliente_nombre:   cli?.nombre||null,
+        fecha_emision:    document.getElementById('f-emision').value,
+        fecha_vencimiento:venc,
+        subtotal:         parseFloat(document.getElementById('f-sub').value)||0,
+        iva:              parseFloat(document.getElementById('f-iva').value)||0,
+        total:            parseFloat(document.getElementById('f-total').value)||0,
+        items:            items,
+        notas:            document.getElementById('f-notas').value.trim(),
+        estado:           'pendiente',
+        created_at:       serverTimestamp(),
+    };
+    try {
+        await addDoc(collection(db,'facturas'), data);
+        toast('Factura creada');
+        closeModal('modal-fact');
+        await cargar();
+    } catch(e) { toast('Error: '+e.message,'err'); }
+    finally { btn.disabled=false; btn.textContent='Guardar factura'; }
+}
+
+window.marcarPagada = async function(id) {
+    if (!ask('¿Marcar esta factura como pagada?')) return;
+    await updateDoc(doc(db,'facturas',id), {estado:'pagada', fecha_pago: new Date().toISOString().split('T')[0]});
+    toast('Factura marcada como pagada ✓');
+    await cargar();
+};
+
+window.anular = async function(id) {
+    if (!ask('¿Anular esta factura?')) return;
+    await updateDoc(doc(db,'facturas',id), {estado:'anulada'});
+    toast('Factura anulada','wrn');
+    await cargar();
+};
+
+window.irAPresupuesto = function(id) {
+    if (id) localStorage.setItem('focus_presupuesto_id', id);
+    window.location.href = 'presupuestos.html';
+};
+
+window.imprimirFactura = function(id) {
+    const f = facturas.find(x => x.id === id);
+    if (!f) { toast('No se encontró la factura','err'); return; }
+
+    const listaItems = (f.items || []).map(it => ({
+        codigo: it.codigo || '',
+        nombre: it.nombre || 'Ítem',
+        tipo: it.tipo || 'item',
+        cantidad: parseFloat(it.cantidad) || 0,
+        precio: parseFloat(it.precio) || 0,
+    }));
+
+    const fecha = f.fecha_emision || new Date().toISOString().split('T')[0];
+    const total = parseFloat(f.total) || 0;
+    const subtotal = parseFloat(f.subtotal) || 0;
+    const iva = parseFloat(f.iva) || 0;
+
+    const rows = listaItems.length
+        ? listaItems.map(it => {
+            const st = (it.cantidad || 0) * (it.precio || 0);
+            return `<tr>
+                <td>${esc(it.nombre)}${it.codigo ? ` [${esc(it.codigo)}]` : ''}</td>
+                <td style="text-align:center">${it.cantidad}</td>
+                <td style="text-align:right">${money(it.precio)}</td>
+                <td style="text-align:right">${money(st)}</td>
+            </tr>`;
+        }).join('')
+        : `<tr><td colspan="4" style="text-align:center;color:#555">Sin ítems detallados</td></tr>`;
+
+    const w = window.open('', '_blank', 'width=980,height=760');
+    if (!w) { toast('No se pudo abrir ventana de impresión','wrn'); return; }
+
+    w.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Factura ${esc(f.numero||id.slice(0,8))}</title>
+        <style>
+            body{font-family:Arial,sans-serif;color:#111;padding:24px}
+            @page { margin: 18mm 12mm; }
+            .wm{position:fixed;inset:0;background:url('assets/logo-watermark.png') center 52%/78% auto no-repeat;opacity:.2;filter:saturate(118%) contrast(108%);pointer-events:none;z-index:0}
+            .sheet{position:relative;z-index:1}
+            .print-head{display:grid;grid-template-columns:1fr 1fr;gap:16px;border-bottom:2px solid #111;padding-bottom:10px;margin-bottom:12px}
+            .print-head h4{margin:0 0 6px 0;font-size:17px}
+            .print-head .line{font-size:11px;color:#333;line-height:1.35}
+            .print-foot{margin-top:18px;border-top:1px solid #ccc;padding-top:8px;font-size:10px;color:#444;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+            h1{margin:0 0 4px 0;font-size:22px}
+            h2{margin:18px 0 8px 0;font-size:16px}
+            .mut{color:#555;font-size:12px}
+            .head{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;border-bottom:1px solid #ddd;padding-bottom:14px;margin-bottom:12px}
+            table{width:100%;border-collapse:collapse;margin-bottom:10px}
+            th,td{padding:8px 6px;border-bottom:1px solid #e5e5e5;font-size:12px}
+            th{background:#f5f5f5}
+            .tot{margin-top:12px;max-width:320px;margin-left:auto}
+            .tot .r{display:flex;justify-content:space-between;padding:4px 0;font-size:13px}
+            .tot .t{border-top:1px solid #111;padding-top:7px;margin-top:4px;font-size:18px;font-weight:700}
+            .notes{margin-top:18px;padding:10px;border:1px solid #ddd;background:#fafafa;font-size:12px}
+            @media print { .wm{opacity:.22;-webkit-print-color-adjust:exact;print-color-adjust:exact;} }
+        </style></head><body>
+        <div class="wm"></div>
+        <div class="sheet">
+        <div class="print-head">
+            <div>
+                <h4>${esc(EMPRESA_PRINT.nombre)}</h4>
+                <div class="line">${esc(EMPRESA_PRINT.rubros)}</div>
+                <div class="line">${esc(EMPRESA_PRINT.cuit)} | ${esc(EMPRESA_PRINT.iibb)}</div>
+            </div>
+            <div style="text-align:right">
+                <div class="line">${esc(EMPRESA_PRINT.direccion)}</div>
+                <div class="line">${esc(EMPRESA_PRINT.telefono)}</div>
+                <div class="line">${esc(EMPRESA_PRINT.email)}</div>
+                <div class="line">${esc(EMPRESA_PRINT.web)}</div>
+            </div>
+        </div>
+        <div class="head">
+            <div>
+                <h1>Factura ${esc(f.numero||id.slice(0,8))}</h1>
+                <div class="mut">Tipo: ${esc(f.tipo||'B')}</div>
+                <div class="mut">Fecha emisión: ${esc(fecha)}</div>
+                <div class="mut">Vencimiento: ${esc(f.fecha_vencimiento||'—')}</div>
+                <div class="mut">Estado: ${esc(f.estado||'pendiente')}</div>
+            </div>
+            <div style="text-align:right">
+                <h2 style="margin:0">GestiónPro</h2>
+                <div class="mut">Cliente: ${esc(f.cliente_nombre||'Sin cliente')}</div>
+            </div>
+        </div>
+
+        <table>
+            <thead><tr><th style="text-align:left">Descripción</th><th>Cant.</th><th style="text-align:right">Unit.</th><th style="text-align:right">Subtotal</th></tr></thead>
+            <tbody>${rows}</tbody>
+        </table>
+
+        <div class="tot">
+            <div class="r"><span>Subtotal</span><span>${money(subtotal)}</span></div>
+            <div class="r"><span>IVA</span><span>${money(iva)}</span></div>
+            <div class="r t"><span>Total</span><span>${money(total)}</span></div>
+        </div>
+
+        ${f.notas ? `<div class="notes"><strong>Notas:</strong><br>${esc(f.notas)}</div>` : ''}
+        <div class="print-foot">
+            <span>${esc(EMPRESA_PRINT.nombre)} - ${esc(EMPRESA_PRINT.rubros)}</span>
+            <span>Documento generado por GestionPro</span>
+        </div>
+        </div>
+        <script>window.onload=()=>window.print();<\/script>
+    </body></html>`);
+    w.document.close();
+};
+</script>
+</body>
+</html>

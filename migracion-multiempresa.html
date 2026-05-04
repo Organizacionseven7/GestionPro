@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Migracion Multiempresa - GestionPro</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="app"></div>
+<div id="toasts"></div>
+
+<script type="module">
+import { auth, db } from './js/firebase-config.js';
+import { onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { collection, getDocs, doc, serverTimestamp, getDoc, updateDoc, setDoc, writeBatch } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-lite.js";
+import { renderSidebar } from './js/sidebar.js';
+import { toast } from './js/utils.js';
+import { ensureUserActive, ensureRoleAllowed, getEmpresaId } from './js/access-control.js';
+
+const COLECCIONES = [
+    'clientes',
+    'productos',
+    'categorias',
+    'proveedores',
+    'pagos',
+    'ventas',
+    'presupuestos',
+    'facturas',
+    'movimientos_stock',
+    'cotizaciones_historial',
+    'config'
+];
+
+let empresaId = null;
+let currentRole = '';
+let resumenPendiente = [];
+let erroresEscaneo = [];
+let advertenciasEscaneo = [];
+let pendientesPorColeccion = {};
+let otrosPorColeccion = {};
+
+onAuthStateChanged(auth, async (user) => {
+    if (!user) { window.location.href = 'login.html'; return; }
+    if (!(await ensureUserActive(auth, db, user))) return;
+    if (!(await ensureRoleAllowed(db, user, ['admin']))) return;
+
+    const ctx = await cargarContextoUsuario(user);
+    empresaId = ctx.empresaId;
+    currentRole = ctx.role;
+    renderApp(user);
+    await migrarPerfilActualSiHaceFalta(user);
+    await escanearPendientes();
+});
+
+async function cargarContextoUsuario(user) {
+    try {
+        const snap = await getDoc(doc(db, 'usuarios', user.uid));
+        if (!snap.exists()) {
+            return { empresaId: user.uid, role: 'admin' };
+        }
+        const data = snap.data() || {};
+        return {
+            empresaId: data.empresa_id || user.uid,
+            role: String(data.rol || 'admin').toLowerCase()
+        };
+    } catch (e) {
+        console.warn('No se pudo leer contexto de usuario. Se usa fallback por uid.', e);
+        return {
+            empresaId: getEmpresaId() || user.uid,
+            role: String(sessionStorage.getItem('gp_user_role') || 'admin').toLowerCase()
+        };
+    }
+}
+
+async function migrarPerfilActualSiHaceFalta(user) {
+    try {
+        const ref = doc(db, 'usuarios', user.uid);
+        const snap = await getDoc(ref);
+        if (!snap.exists()) return;
+
+        const data = snap.data() || {};
+        if (data.empresa_id) return;
+
+        await updateDoc(ref, { empresa_id: empresaId, updated_at: serverTimestamp() });
+        toast('Perfil de usuario actualizado con empresa_id');
+    } catch (e) {
+        console.warn('No se pudo actualizar perfil actual en migracion:', e);
+    }
+}
+
+function renderApp(user) {
+    document.getElementById('app').innerHTML = `
+        ${renderSidebar('dashboard')}
+        <main class="main">
+            <header class="topbar">
+                <div style="display:flex;align-items:center;gap:10px">
+                    <button class="btn btn-ghost btn-sm btn-menu">☰</button>
+                    <span class="topbar-title">Migracion Multiempresa</span>
+                </div>
+                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                    <button class="btn btn-ghost" id="btn-escanear">Escanear</button>
+                    <button class="btn btn-primary" id="btn-migrar">Aplicar migracion</button>
+                    <button class="btn btn-ghost" id="btn-reasignar">Reasignar datos a esta empresa</button>
+                    <button class="btn btn-ghost" id="btn-set-seven">Asignar empresa_id = Seven</button>
+                </div>
+            </header>
+            <div class="page">
+                <div class="card" style="margin-bottom:12px">
+                    <div class="card-header"><h2>Estado</h2></div>
+                    <div style="padding:12px;font-size:13px;line-height:1.45">
+                        <div><strong>Usuario:</strong> ${esc(user.email || '-')}</div>
+                        <div><strong>Rol detectado:</strong> <code>${esc(currentRole || '-')}</code></div>
+                        <div><strong>empresa_id destino:</strong> <code>${esc(empresaId || '-')}</code></div>
+                        <div style="margin-top:8px;color:var(--muted)">Esta herramienta completa <code>empresa_id</code> en documentos viejos que no lo tengan.</div>
+                        <div id="estado-migracion" style="margin-top:8px;color:var(--muted)">Listo para escanear y migrar.</div>
+                        <div id="estado-completado" style="display:none;margin-top:8px;color:var(--success);font-weight:700">Migracion completada: no quedan documentos pendientes.</div>
+                    </div>
+                </div>
+
+                <div class="card" style="margin-bottom:12px">
+                    <div class="card-header"><h2>Empresa destino</h2></div>
+                    <div style="padding:12px;font-size:13px;line-height:1.45">
+                        <div style="margin-bottom:8px">ID actual: <code id="empresa-id-actual">${esc(empresaId || '-')}</code></div>
+                        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+                            <input id="inp-empresa-id" class="inp" style="max-width:240px" placeholder="Nuevo empresa_id (ej: Seven)" value="Seven">
+                            <button class="btn btn-primary" id="btn-set-empresa">Asignar empresa_id</button>
+                            <button class="btn btn-ghost" id="btn-set-seven-inline">Usar Seven</button>
+                        </div>
+                        <div style="margin-top:8px;color:var(--muted)">Esto actualiza tu perfil admin y crea/actualiza la empresa destino.</div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header"><h2>Resumen por coleccion</h2></div>
+                    <div class="table-wrap">
+                        <table>
+                            <thead><tr><th>Coleccion</th><th>Total docs</th><th>De esta empresa</th><th>Sin empresa_id</th><th>Otras empresas</th></tr></thead>
+                            <tbody id="tbody-resumen"></tbody>
+                        </table>
+                    </div>
+                    <div class="pag"><span id="pag-info">-</span></div>
+                    <div id="detalle-pendientes" style="padding:0 12px 12px;color:var(--muted);font-size:12px"></div>
+                </div>
+            </div>
+        </main>`;
+
+    document.getElementById('btn-logout').addEventListener('click', () => signOut(auth).then(() => location.href='login.html'));
+    document.getElementById('user-name').textContent = user.email;
+    document.getElementById('user-avatar').textContent = user.email[0].toUpperCase();
+    document.querySelector('.btn-menu')?.addEventListener('click', () => document.querySelector('.sidebar')?.classList.toggle('open'));
+
+    document.getElementById('btn-escanear')?.addEventListener('click', escanearPendientes);
+    document.getElementById('btn-migrar')?.addEventListener('click', ejecutarMigracion);
+    document.getElementById('btn-reasignar')?.addEventListener('click', ejecutarReasignacionTotal);
+    document.getElementById('btn-set-seven')?.addEventListener('click', () => asignarEmpresaIdActual('Seven'));
+    document.getElementById('btn-set-seven-inline')?.addEventListener('click', () => asignarEmpresaIdActual('Seven'));
+    document.getElementById('btn-set-empresa')?.addEventListener('click', () => {
+        const valor = document.getElementById('inp-empresa-id')?.value || '';
+        asignarEmpresaIdActual(valor);
+    });
+}
+
+async function escanearPendientes() {
+    const tbody = document.getElementById('tbody-resumen');
+    const pag = document.getElementById('pag-info');
+    if (!tbody || !pag) return;
+
+    tbody.innerHTML = `<tr><td colspan="3" style="color:var(--muted)">Escaneando...</td></tr>`;
+
+    try {
+        const resultados = [];
+        const errores = [];
+        const advertencias = [];
+        const nuevosPendientes = {};
+        const nuevosOtros = {};
+
+        for (const col of COLECCIONES) {
+            try {
+                const snap = await getDocs(collection(db, col));
+                const idsPendientes = [];
+                const idsOtros = [];
+                let propios = 0;
+                snap.forEach(d => {
+                    const data = d.data() || {};
+                    if (!hasEmpresaId(data)) {
+                        idsPendientes.push(d.id);
+                        return;
+                    }
+                    const emp = String(data.empresa_id || '').trim();
+                    if (emp === empresaId) propios++;
+                    else idsOtros.push(d.id);
+                });
+                const faltantes = idsPendientes.length;
+                const otros = idsOtros.length;
+                if (faltantes) nuevosPendientes[col] = idsPendientes;
+                if (otros) nuevosOtros[col] = idsOtros;
+                resultados.push({ coleccion: col, total: snap.size, propios, faltantes, otros, error: '', warning: '' });
+            } catch (scanErr) {
+                const detail = `${scanErr?.code || 'error'}: ${scanErr?.message || 'sin detalle'}`;
+                console.error(`Lectura fallida en ${col}`, scanErr);
+                if (isPermissionDenied(scanErr)) {
+                    advertencias.push({ coleccion: col, detail });
+                    resultados.push({ coleccion: col, total: 0, propios: 0, faltantes: 0, otros: 0, error: '', warning: 'sin permiso de lectura' });
+                } else {
+                    errores.push({ coleccion: col, detail });
+                    resultados.push({ coleccion: col, total: 0, propios: 0, faltantes: 0, otros: 0, error: detail, warning: '' });
+                }
+            }
+        }
+
+        resumenPendiente = resultados;
+        pendientesPorColeccion = nuevosPendientes;
+        otrosPorColeccion = nuevosOtros;
+        erroresEscaneo = errores;
+        advertenciasEscaneo = advertencias;
+        renderResumen();
+        if (errores.length) {
+            toast(`Escaneo parcial: ${errores.length} coleccion(es) con error`, 'wrn');
+            setEstadoMigracion(`Escaneo parcial: ${errores.length} coleccion(es) con error.`);
+        } else if (advertencias.length) {
+            toast(`Escaneo parcial: ${advertencias.length} coleccion(es) sin permiso`, 'wrn');
+            setEstadoMigracion(`Escaneo parcial: ${advertencias.length} coleccion(es) sin permiso.`);
+        } else {
+            toast('Escaneo completado');
+            setEstadoMigracion('Escaneo completado. Podés aplicar migración.');
+        }
+    } catch (e) {
+        console.error(e);
+        tbody.innerHTML = `<tr><td colspan="3" style="color:var(--danger)">Error al escanear: ${esc(e.message || 'sin detalle')}</td></tr>`;
+        pag.textContent = 'Error';
+    }
+}
+
+function renderResumen() {
+    const tbody = document.getElementById('tbody-resumen');
+    const pag = document.getElementById('pag-info');
+    const btnMigrar = document.getElementById('btn-migrar');
+    const estadoCompletado = document.getElementById('estado-completado');
+    const detallePendientes = document.getElementById('detalle-pendientes');
+    const btnReasignar = document.getElementById('btn-reasignar');
+    const btnSetSeven = document.getElementById('btn-set-seven');
+    const empresaActualEl = document.getElementById('empresa-id-actual');
+    const btnSetEmpresa = document.getElementById('btn-set-empresa');
+    const btnSetSevenInline = document.getElementById('btn-set-seven-inline');
+    if (!tbody || !pag) return;
+
+    if (empresaActualEl) empresaActualEl.textContent = empresaId || '-';
+
+    if (!resumenPendiente.length) {
+        tbody.innerHTML = `<tr><td colspan="3" style="color:var(--muted)">Sin resultados</td></tr>`;
+        pag.textContent = '-';
+        if (btnMigrar) {
+            btnMigrar.disabled = true;
+            btnMigrar.textContent = 'Sin pendientes';
+        }
+        return;
+    }
+
+    const totalFaltantes = resumenPendiente.reduce((a, r) => a + r.faltantes, 0);
+    const totalOtros = resumenPendiente.reduce((a, r) => a + (r.otros || 0), 0);
+    const migracionCompleta = totalFaltantes === 0 && erroresEscaneo.length === 0;
+    tbody.innerHTML = resumenPendiente.map(r => `
+        <tr>
+            <td><code>${esc(r.coleccion)}</code></td>
+            <td>${r.total}</td>
+            <td>${r.propios || 0}</td>
+            <td style="font-weight:700;color:${r.error ? 'var(--danger)' : (r.faltantes ? 'var(--warning)' : 'var(--success)')}">
+                ${r.error ? `ERR <span style="font-weight:400">(${esc(r.error)})</span>` : (r.warning ? `<span style="font-weight:400;color:var(--muted)">${esc(r.warning)}</span>` : r.faltantes)}
+            </td>
+            <td style="font-weight:700;color:${(r.otros || 0) ? 'var(--warning)' : 'var(--success)'}">${r.otros || 0}</td>
+        </tr>
+    `).join('');
+    if (erroresEscaneo.length) {
+        pag.textContent = `${totalFaltantes} pendientes | ${erroresEscaneo.length} coleccion(es) con error`;
+    } else if (advertenciasEscaneo.length) {
+        pag.textContent = `${totalFaltantes} pendientes | ${totalOtros} en otras empresas | ${advertenciasEscaneo.length} coleccion(es) sin permiso`;
+    } else {
+        pag.textContent = `${totalFaltantes} documento${totalFaltantes !== 1 ? 's' : ''} sin empresa_id | ${totalOtros} documento${totalOtros !== 1 ? 's' : ''} en otras empresas`;
+    }
+
+    if (estadoCompletado) {
+        estadoCompletado.style.display = migracionCompleta ? 'block' : 'none';
+    }
+
+    if (migracionCompleta) {
+        setEstadoMigracion('Migracion completada. No quedan pendientes.');
+    }
+
+    if (detallePendientes) {
+        const entries = Object.entries(pendientesPorColeccion);
+        const entriesOtros = Object.entries(otrosPorColeccion);
+        if (!entries.length && !entriesOtros.length) {
+            detallePendientes.textContent = '';
+        } else {
+            const lineasFaltantes = entries
+                .map(([col, ids]) => `${col}: ${ids.length} sin empresa_id (ej: ${ids.slice(0, 3).join(', ')})`)
+                .join(' | ');
+            const lineasOtros = entriesOtros
+                .map(([col, ids]) => `${col}: ${ids.length} de otra empresa (ej: ${ids.slice(0, 3).join(', ')})`)
+                .join(' | ');
+            const bloqueFaltantes = lineasFaltantes ? `Sin empresa_id: ${lineasFaltantes}` : '';
+            const bloqueOtros = lineasOtros ? `Otras empresas: ${lineasOtros}` : '';
+            detallePendientes.textContent = [bloqueFaltantes, bloqueOtros].filter(Boolean).join(' || ');
+        }
+    }
+
+    if (btnMigrar) {
+        btnMigrar.disabled = totalFaltantes === 0 || erroresEscaneo.length > 0;
+        btnMigrar.textContent = migracionCompleta ? 'Migracion completada' : (totalFaltantes === 0 ? 'Sin pendientes' : 'Aplicar migracion');
+        if (erroresEscaneo.length > 0) btnMigrar.textContent = 'Corregir errores de escaneo';
+    }
+
+    if (btnReasignar) {
+        btnReasignar.disabled = totalOtros === 0 || erroresEscaneo.length > 0;
+        if (erroresEscaneo.length > 0) btnReasignar.textContent = 'Corregir escaneo';
+        else btnReasignar.textContent = totalOtros === 0 ? 'Sin datos para reasignar' : 'Reasignar datos a esta empresa';
+    }
+
+    if (btnSetSeven) {
+        const yaAsignada = empresaId === 'Seven';
+        btnSetSeven.disabled = yaAsignada;
+        btnSetSeven.textContent = yaAsignada ? 'empresa_id actual: Seven' : 'Asignar empresa_id = Seven';
+    }
+
+    if (btnSetSevenInline) {
+        btnSetSevenInline.disabled = empresaId === 'Seven';
+    }
+
+    if (btnSetEmpresa) {
+        btnSetEmpresa.disabled = false;
+    }
+}
+
+async function ejecutarMigracion() {
+    if (!empresaId) { toast('No se detecto empresa_id', 'err'); return; }
+    if (currentRole !== 'admin') { toast('Solo admin puede migrar documentos legacy', 'err'); return; }
+
+    const totalPendientes = resumenPendiente.reduce((a, r) => a + r.faltantes, 0);
+    if (!totalPendientes) {
+        toast('No hay documentos pendientes');
+        setEstadoMigracion('No hay documentos pendientes para migrar.');
+        return;
+    }
+
+    if (!Object.keys(pendientesPorColeccion).length && totalPendientes > 0) {
+        await escanearPendientes();
+    }
+
+    toast(`Iniciando migración de ${totalPendientes} documento(s)...`);
+    setEstadoMigracion(`Preparando migración de ${totalPendientes} documento(s)...`);
+    if (!confirm(`Se actualizaran ${totalPendientes} documentos con empresa_id=${empresaId}. Continuar?`)) {
+        toast('Migración cancelada por el usuario', 'wrn');
+        setEstadoMigracion('Migración cancelada.');
+        return;
+    }
+
+    const btn = document.getElementById('btn-migrar');
+    btn.disabled = true;
+    const prevText = btn.textContent;
+    btn.textContent = 'Migrando...';
+    setEstadoMigracion('Migración en curso...');
+
+    try {
+        const saltadas = [];
+        const detalle = [];
+        const CHUNK_SIZE = 200;
+        let procesados = 0;
+        let okTotal = 0;
+        let errTotal = 0;
+
+        setEstadoMigracion(`Migración en curso... 0/${totalPendientes}`);
+
+        for (const col of COLECCIONES) {
+            const ids = pendientesPorColeccion[col] || [];
+            if (!ids.length) continue;
+            let ok = 0;
+            let err = 0;
+
+            for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+                const chunk = ids.slice(i, i + CHUNK_SIZE);
+                let committed = false;
+
+                try {
+                    const batch = writeBatch(db);
+                    for (const docId of chunk) {
+                        batch.update(doc(db, col, docId), {
+                            empresa_id: empresaId,
+                            updated_at: serverTimestamp(),
+                        });
+                    }
+                    await batch.commit();
+                    committed = true;
+                    ok += chunk.length;
+                    okTotal += chunk.length;
+                    procesados += chunk.length;
+                    setEstadoMigracion(`Migración en curso... ${procesados}/${totalPendientes}`);
+                } catch (batchErr) {
+                    console.warn(`Fallo batch en ${col}; fallback por documento`, batchErr);
+                }
+
+                if (committed) continue;
+
+                // Fallback: si un lote falla, intentamos documento por documento.
+                for (const docId of chunk) {
+                    try {
+                        await updateDoc(doc(db, col, docId), {
+                            empresa_id: empresaId,
+                            updated_at: serverTimestamp(),
+                        });
+                        ok++;
+                        okTotal++;
+                    } catch (upErr) {
+                        try {
+                            await setDoc(doc(db, col, docId), {
+                                empresa_id: empresaId,
+                                updated_at: serverTimestamp(),
+                            }, { merge: true });
+                            ok++;
+                            okTotal++;
+                        } catch (setErr) {
+                            console.error(`No se pudo migrar ${col}/${docId}`, setErr);
+                            err++;
+                            errTotal++;
+                        }
+                    } finally {
+                        procesados++;
+                        setEstadoMigracion(`Migración en curso... ${procesados}/${totalPendientes}`);
+                    }
+                }
+            }
+
+            if (ok || err) detalle.push(`${col}: ${ok} ok, ${err} error(es)`);
+        }
+
+        if (saltadas.length || errTotal > 0) {
+            const resumen = detalle.length ? ` | ${detalle.join(' ; ')}` : '';
+            const saltadasTxt = saltadas.length ? ` | Saltadas: ${saltadas.join(', ')}` : '';
+            const msg = `Migracion parcial${saltadasTxt}${resumen}`;
+            toast(msg, 'wrn');
+            setEstadoMigracion(msg);
+        } else {
+            const msg = `Migración finalizada correctamente (${okTotal}/${totalPendientes})`;
+            toast(msg);
+            setEstadoMigracion(msg);
+        }
+        await escanearPendientes();
+    } catch (e) {
+        console.error(e);
+        toast('Error en migracion: ' + (e.message || 'sin detalle'), 'err');
+        setEstadoMigracion('Error durante migración. Revisá consola y mensaje superior.');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = prevText;
+    }
+}
+
+async function ejecutarReasignacionTotal() {
+    if (!empresaId) { toast('No se detecto empresa_id', 'err'); return; }
+    if (currentRole !== 'admin') { toast('Solo admin puede reasignar datos', 'err'); return; }
+
+    const totalOtros = resumenPendiente.reduce((a, r) => a + (r.otros || 0), 0);
+    if (!totalOtros) {
+        toast('No hay datos en otras empresas para reasignar');
+        return;
+    }
+
+    if (!confirm(`Se reasignaran ${totalOtros} documento(s) al empresa_id ${empresaId}. Continuar?`)) return;
+
+    const btn = document.getElementById('btn-reasignar');
+    const prev = btn ? btn.textContent : '';
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Reasignando...';
+    }
+
+    try {
+        let ok = 0;
+        let err = 0;
+        const CHUNK_SIZE = 200;
+        let procesados = 0;
+        setEstadoMigracion(`Reasignación en curso... 0/${totalOtros}`);
+
+        for (const col of COLECCIONES) {
+            const ids = otrosPorColeccion[col] || [];
+            if (!ids.length) continue;
+
+            for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+                const chunk = ids.slice(i, i + CHUNK_SIZE);
+                let committed = false;
+                try {
+                    const batch = writeBatch(db);
+                    for (const docId of chunk) {
+                        batch.update(doc(db, col, docId), {
+                            empresa_id: empresaId,
+                            updated_at: serverTimestamp(),
+                        });
+                    }
+                    await batch.commit();
+                    ok += chunk.length;
+                    procesados += chunk.length;
+                    committed = true;
+                    setEstadoMigracion(`Reasignación en curso... ${procesados}/${totalOtros}`);
+                } catch {
+                    // fallback por documento
+                }
+
+                if (committed) continue;
+
+                for (const docId of chunk) {
+                    try {
+                        await setDoc(doc(db, col, docId), {
+                            empresa_id: empresaId,
+                            updated_at: serverTimestamp(),
+                        }, { merge: true });
+                        ok++;
+                    } catch (e) {
+                        console.error(`No se pudo reasignar ${col}/${docId}`, e);
+                        err++;
+                    } finally {
+                        procesados++;
+                        setEstadoMigracion(`Reasignación en curso... ${procesados}/${totalOtros}`);
+                    }
+                }
+            }
+        }
+
+        if (err > 0) {
+            toast(`Reasignación parcial: ${ok} ok, ${err} error(es)`, 'wrn');
+            setEstadoMigracion(`Reasignación parcial: ${ok} ok, ${err} error(es).`);
+        } else {
+            toast(`Reasignación finalizada: ${ok} documento(s)`);
+            setEstadoMigracion(`Reasignación finalizada: ${ok} documento(s).`);
+        }
+
+        await escanearPendientes();
+    } catch (e) {
+        console.error(e);
+        toast('Error en reasignación: ' + (e.message || 'sin detalle'), 'err');
+        setEstadoMigracion('Error durante reasignación. Revisá la consola.');
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = prev || 'Reasignar datos a esta empresa';
+        }
+    }
+}
+
+async function asignarEmpresaIdActual(nuevoId) {
+    const user = auth.currentUser;
+    if (!user) { toast('Sesión no disponible', 'err'); return; }
+    if (currentRole !== 'admin') { toast('Solo admin puede cambiar empresa_id', 'err'); return; }
+
+    const target = String(nuevoId || '').trim();
+    if (!target) { toast('empresa_id inválido', 'err'); return; }
+    if (empresaId === target) {
+        toast(`Tu empresa ya usa el ID ${target}`);
+        return;
+    }
+
+    if (!confirm(`Se asignará empresa_id=${target} a tu empresa actual. Continuar?`)) return;
+
+    const btn = document.getElementById('btn-set-seven');
+    const prev = btn ? btn.textContent : '';
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Asignando...';
+    }
+    setEstadoMigracion(`Asignando empresa_id=${target}...`);
+
+    try {
+        await updateDoc(doc(db, 'usuarios', user.uid), {
+            empresa_id: target,
+            updated_at: serverTimestamp(),
+        });
+
+        await setDoc(doc(db, 'empresas', target), {
+            nombre: (user.email || 'Empresa').split('@')[0],
+            owner_uid: user.uid,
+            owner_email: user.email || '',
+            activo: true,
+            updated_at: serverTimestamp(),
+        }, { merge: true });
+
+        sessionStorage.setItem('gp_empresa_id', target);
+        empresaId = target;
+        toast(`empresa_id asignado correctamente: ${target}`);
+        setEstadoMigracion(`empresa_id actualizado a ${target}. Reescaneando...`);
+        await escanearPendientes();
+    } catch (e) {
+        console.error(e);
+        toast('No se pudo asignar empresa_id: ' + (e.message || 'sin detalle'), 'err');
+        setEstadoMigracion('Error al asignar empresa_id.');
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = prev || 'Asignar empresa_id = Seven';
+        }
+        renderResumen();
+    }
+}
+
+function isPermissionDenied(err) {
+    const code = String(err?.code || '').toLowerCase();
+    const msg = String(err?.message || '').toLowerCase();
+    return code.includes('permission-denied') || msg.includes('missing or insufficient permissions');
+}
+
+function hasEmpresaId(data = {}) {
+    const raw = data.empresa_id;
+    if (raw === null || raw === undefined) return false;
+    return String(raw).trim().length > 0;
+}
+
+function setEstadoMigracion(msg) {
+    const el = document.getElementById('estado-migracion');
+    if (el) el.textContent = msg;
+}
+
+function esc(str = '') {
+    return String(str)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+}
+</script>
+</body>
+</html>

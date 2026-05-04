@@ -1,0 +1,1373 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Productos — GestiónPro</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="app"></div>
+<div id="toasts"></div>
+
+<script type="module">
+import { auth, db } from './js/firebase-config.js';
+import { onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { collection, doc, getDoc, getDocs, setDoc, addDoc, updateDoc, query, where, orderBy, limit, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-lite.js";
+import { renderSidebar } from './js/sidebar.js';
+import { toast, openModal, closeModal, money, ask, genId } from './js/utils.js';
+import { ensureUserActive } from './js/access-control.js';
+import { ensureRoleAllowed } from './js/access-control.js';
+import { getEmpresaId } from './js/access-control.js';
+
+let productos = [], categorias = [], proveedores = [];
+let productosFiltrados = [];
+let productosVisibles = [];
+let productosSeleccionados = new Set();
+let filtroDebounceTimer = null;
+let paginaActual = 1;
+let pageSize = 100;
+let editId = null;
+let currentUser = null;
+let currentEmpresaId = null;
+let cotizacionGlobal = null;
+let configFinanzas = {};
+
+function configFinanzasRef() {
+    return doc(db, 'config', `finanzas_${currentEmpresaId || 'default'}`);
+}
+
+function usd(n) {
+    return new Intl.NumberFormat('es-AR', { style:'currency', currency:'USD', minimumFractionDigits:2 }).format(parseFloat(n||0));
+}
+
+onAuthStateChanged(auth, async user => {
+    if (!user) { window.location.href = 'login.html'; return; }
+    if (!(await ensureUserActive(auth, db, user))) return;
+    if (!(await ensureRoleAllowed(db, user, ['admin', 'operador']))) return;
+    currentUser = user;
+    currentEmpresaId = getEmpresaId() || user.uid;
+    renderApp();
+    document.getElementById('btn-logout').addEventListener('click', () => signOut(auth).then(() => location.href='login.html'));
+    document.getElementById('user-name').textContent = user.email;
+    document.getElementById('user-avatar').textContent = user.email[0].toUpperCase();
+    await Promise.all([cargarCategorias(), cargarProveedores(), cargarProductos(), cargarHistorialCotizacion()]);
+    await cargarCotizacionGlobal();
+    await syncCotizacionAutomatica();
+});
+
+function renderApp() {
+    document.getElementById('app').innerHTML = `
+        ${renderSidebar('productos')}
+        <main class="main">
+            <header class="topbar">
+                <div style="display:flex;align-items:center;gap:10px">
+                    <button class="btn btn-ghost btn-sm btn-menu">☰</button>
+                    <span class="topbar-title">Productos</span>
+                </div>
+                <button class="btn btn-primary" id="btn-nuevo">+ Nuevo producto</button>
+            </header>
+            <div class="page">
+                <div class="stats-grid" id="stats">
+                    <div class="stat-card c-accent"><div class="slabel">Total</div><div class="sval" id="s-total">—</div></div>
+                    <div class="stat-card c-warn"><div class="slabel">Stock bajo</div><div class="sval" id="s-bajo">—</div><div class="ssub">bajo el mínimo</div></div>
+                    <div class="stat-card c-ok"><div class="slabel">Valor inventario</div><div class="sval" style="font-size:18px" id="s-valor">—</div><div class="ssub">a precio de costo</div></div>
+                </div>
+
+                <div class="card" style="margin-bottom:14px">
+                    <div class="card-header">
+                        <h2>Cotización USD global</h2>
+                        <a href="https://www.bcra.gob.ar/PublicacionesEstadisticas/Tipo_de_cambio_minorista.asp" target="_blank" rel="noopener" style="font-size:12px;color:var(--muted)">Referencia BCRA</a>
+                    </div>
+                    <div style="padding:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+                        <input class="inp" type="number" id="tc-global" min="0" step="0.01" style="max-width:180px" placeholder="Ej: 1185">
+                        <button class="btn btn-primary" id="btn-tc-global-aplicar">Aplicar a todos</button>
+                        <button class="btn btn-ghost" id="btn-tc-oficial">Tomar oficial (online)</button>
+                        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)"><input type="checkbox" id="tc-auto-sync"> Auto actualizar al abrir</label>
+                        <span id="tc-global-info" style="font-size:12px;color:var(--muted)">Sin valor configurado</span>
+                    </div>
+                </div>
+
+                <div class="card" style="margin-bottom:14px">
+                    <div class="card-header"><h2>Historial de cotizaciones</h2></div>
+                    <div class="table-wrap">
+                        <table>
+                            <thead><tr><th>Fecha</th><th>Cotización</th><th>Usuario</th><th>Productos</th><th>Recalculados</th></tr></thead>
+                            <tbody id="tbody-hist-tc"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Listado de productos</h2>
+                        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+                            <button class="btn btn-ghost btn-sm" id="btn-nueva-cat">+ Categoría</button>
+                            <button class="btn btn-ghost btn-sm" id="btn-carga-masiva">+ Carga masiva</button>
+                            <button class="btn btn-ghost btn-sm" id="btn-tc-masiva">↻ Cotización masiva</button>
+                            <button class="btn btn-ghost btn-sm" id="btn-select-all-products">Seleccionar visibles</button>
+                            <button class="btn btn-ghost btn-sm" id="btn-clear-selection">Limpiar selección</button>
+                            <button class="btn btn-ghost btn-sm" id="btn-tc-selected">TC a seleccionados</button>
+                            <button class="btn btn-danger btn-sm" id="btn-delete-selected">Eliminar seleccionados</button>
+                            <input class="inp inp-search" id="busca" placeholder="Buscar…" oninput="window.filtrarDebounced()">
+                            <select class="inp" id="fcat" onchange="window.filtrar()" style="width:auto"><option value="">Todas las categorías</option></select>
+                            <select class="inp" id="fmoneda" onchange="window.filtrar()" style="width:auto">
+                                <option value="">Todas las monedas</option>
+                                <option value="ARS">Base ARS</option>
+                                <option value="USD">Base USD</option>
+                            </select>
+                            <select class="inp" id="fmarca" onchange="window.filtrar()" style="width:auto">
+                                <option value="">Todas las marcas</option>
+                            </select>
+                            <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);cursor:pointer">
+                                <input type="checkbox" id="fstock" onchange="window.filtrar()"> Stock bajo
+                            </label>
+                            <span id="selection-info" style="font-size:12px;color:var(--muted)">0 seleccionados</span>
+                        </div>
+                    </div>
+                    <div id="marca-resumen" style="padding:10px 12px;border-bottom:1px solid var(--border);display:flex;gap:8px;flex-wrap:wrap"></div>
+                    <div class="table-wrap">
+                        <table>
+                            <thead><tr><th style="width:36px"><input type="checkbox" id="check-all-visible" title="Seleccionar visibles"></th><th>Código</th><th>Producto</th><th>Categoría</th><th>P. Venta</th><th>P. Costo</th><th>Stock</th><th>Acciones</th></tr></thead>
+                            <tbody id="tbody"></tbody>
+                        </table>
+                    </div>
+                    <div class="pag" style="display:flex;gap:8px;align-items:center;justify-content:flex-end;flex-wrap:wrap">
+                        <button class="btn btn-ghost btn-sm" id="btn-prev-page">←</button>
+                        <span id="pag-info">—</span>
+                        <button class="btn btn-ghost btn-sm" id="btn-next-page">→</button>
+                        <select class="inp" id="page-size" style="width:auto">
+                            <option value="50">50</option>
+                            <option value="100" selected>100</option>
+                            <option value="200">200</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <!-- MODAL PRODUCTO -->
+        <div class="overlay" id="modal-prod">
+            <div class="modal">
+                <div class="modal-head">
+                    <h3 id="modal-title">Nuevo producto</h3>
+                    <button class="btn btn-ghost btn-sm" onclick="closeModal('modal-prod')">✕</button>
+                </div>
+                <div class="modal-body">
+                    <div class="form-grid">
+                        <div class="fgroup"><label>Código</label><input class="inp" id="f-codigo" placeholder="Auto si se deja vacío"></div>
+                        <div class="fgroup"><label>Unidad</label>
+                            <select class="inp" id="f-unidad">
+                                <option>unidad</option><option>kg</option><option>gr</option>
+                                <option>litro</option><option>ml</option><option>metro</option>
+                                <option>caja</option><option>par</option>
+                            </select>
+                        </div>
+                        <div class="fgroup"><label>Moneda base</label>
+                            <select class="inp" id="f-moneda" onchange="window.toggleMonedaBaseForm()">
+                                <option value="ARS">ARS (pesos)</option>
+                                <option value="USD">USD (dólares)</option>
+                            </select>
+                        </div>
+                        <div class="fgroup" style="display:flex;justify-content:flex-end;align-items:flex-end">
+                            <span style="font-size:11px;color:var(--muted)">ARS: costo/venta en pesos | USD: costo en USD + cotización</span>
+                        </div>
+                        <div class="fgroup full"><label>Nombre *</label><input class="inp" id="f-nombre" required placeholder="Ej: Remera básica talle M"></div>
+                        <div class="fgroup full"><label>Descripción</label><input class="inp" id="f-desc" placeholder="Descripción opcional"></div>
+                        <div class="fgroup"><label>Categoría</label><select class="inp" id="f-cat"><option value="">Sin categoría</option></select></div>
+                        <div class="fgroup"><label>Proveedor</label><select class="inp" id="f-prov"><option value="">Sin proveedor</option></select></div>
+                        <div class="fgroup"><label>Cotización USD → ARS</label><input class="inp" type="number" id="f-tc" min="0" step="0.01" value="0" oninput="calcCostoArs();calcMargen()"></div>
+                        <div class="fgroup"><label>Costo USD</label><input class="inp" type="number" id="f-costo-usd" min="0" step="0.01" value="0" oninput="calcCostoArs();calcMargen()"></div>
+                        <div class="fgroup"><label>Costo ARS</label><input class="inp" type="number" id="f-costo" min="0" step="0.01" value="0" oninput="calcMargen()"></div>
+                        <div class="fgroup"><label>Precio venta *</label><input class="inp" type="number" id="f-venta" min="0" step="0.01" required oninput="calcMargen()"></div>
+                        <div class="fgroup"><label>Precio mayorista</label><input class="inp" type="number" id="f-mayor" min="0" step="0.01"></div>
+                        <div class="fgroup" style="justify-content:flex-end;padding-top:18px">
+                            <span style="font-size:12px;color:var(--muted)">Margen: <strong id="margen" style="color:var(--success)">—</strong></span>
+                        </div>
+                        <div class="fgroup"><label>Stock actual</label><input class="inp" type="number" id="f-stock" min="0" value="0"></div>
+                        <div class="fgroup"><label>Stock mínimo</label><input class="inp" type="number" id="f-stockmin" min="0" value="5"></div>
+                    </div>
+                </div>
+                <div class="modal-foot">
+                    <button class="btn btn-ghost" onclick="closeModal('modal-prod')">Cancelar</button>
+                    <button class="btn btn-primary" id="btn-guardar">Guardar</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="overlay" id="modal-cat">
+            <div class="modal" style="max-width:460px">
+                <div class="modal-head">
+                    <h3>Nueva categoría</h3>
+                    <button class="btn btn-ghost btn-sm" onclick="closeModal('modal-cat')">✕</button>
+                </div>
+                <div class="modal-body">
+                    <div class="fgroup">
+                        <label>Nombre *</label>
+                        <input class="inp" id="cat-nombre" placeholder="Ej: Indumentaria">
+                    </div>
+                </div>
+                <div class="modal-foot">
+                    <button class="btn btn-ghost" onclick="closeModal('modal-cat')">Cancelar</button>
+                    <button class="btn btn-primary" id="btn-guardar-cat">Guardar categoría</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="overlay" id="modal-carga-masiva">
+            <div class="modal" style="max-width:760px">
+                <div class="modal-head">
+                    <h3>Carga masiva de productos</h3>
+                    <button class="btn btn-ghost btn-sm" onclick="closeModal('modal-carga-masiva')">✕</button>
+                </div>
+                <div class="modal-body">
+                    <p style="font-size:12px;color:var(--muted);margin-bottom:10px">
+                        Pegá una línea por producto. Delimitador recomendado: <strong>;</strong>. También acepta tabulación o coma.
+                    </p>
+                    <p style="font-size:12px;color:var(--muted);margin-bottom:8px">
+                        Orden de columnas:
+                        <code>nombre;precio_venta;precio_costo;stock_actual;stock_minimo;codigo;categoria;proveedor;unidad;costo_usd;cotizacion_usd_ars;descripcion</code>
+                    </p>
+                    <p style="font-size:12px;color:var(--muted);margin-bottom:10px">
+                        La primera línea puede ser encabezado (por ejemplo, si empieza con <code>nombre</code>).
+                    </p>
+                    <textarea class="inp" id="m-carga-texto" style="min-height:230px;font-family:'DM Mono',monospace" placeholder="nombre;precio_venta;precio_costo;stock_actual;stock_minimo;codigo;categoria;proveedor;unidad;costo_usd;cotizacion_usd_ars;descripcion&#10;Remera básica;15990;9000;15;5;PROD-001;Indumentaria;Proveedor X;unidad;7.5;1200;Algodón peinado"></textarea>
+                    <div id="m-carga-resumen" style="margin-top:10px;font-size:12px;color:var(--muted)"></div>
+                    <div id="m-carga-preview" style="margin-top:10px"></div>
+                </div>
+                <div class="modal-foot">
+                    <button class="btn btn-ghost" onclick="closeModal('modal-carga-masiva')">Cancelar</button>
+                    <button class="btn btn-ghost" id="btn-plantilla-masiva">Descargar plantilla CSV</button>
+                    <button class="btn btn-ghost" id="btn-preview-masivo">Previsualizar</button>
+                    <button class="btn btn-primary" id="btn-importar-masivo">Importar</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="overlay" id="modal-tc">
+            <div class="modal" style="max-width:520px">
+                <div class="modal-head">
+                    <h3>Actualizar cotización masiva</h3>
+                    <button class="btn btn-ghost btn-sm" onclick="closeModal('modal-tc')">✕</button>
+                </div>
+                <div class="modal-body">
+                    <div class="fgroup" style="margin-bottom:12px">
+                        <label>Nueva cotización USD → ARS *</label>
+                        <input class="inp" type="number" id="m-tc" min="0" step="0.01" placeholder="Ej: 1185">
+                    </div>
+                    <p style="font-size:12px;color:var(--muted)">
+                        Esta acción actualiza <strong>cotizacion_usd_ars</strong> en todos los productos activos y recalcula <strong>precio_costo</strong>
+                        en los que tengan <strong>precio_costo_usd</strong> cargado.
+                    </p>
+                </div>
+                <div class="modal-foot">
+                    <button class="btn btn-ghost" onclick="closeModal('modal-tc')">Cancelar</button>
+                    <button class="btn btn-primary" id="btn-aplicar-tc">Aplicar cotización</button>
+                </div>
+            </div>
+        </div>`;
+
+    document.getElementById('btn-nuevo').addEventListener('click', () => abrirNuevo());
+    document.getElementById('btn-guardar').addEventListener('click', guardar);
+    document.getElementById('btn-nueva-cat').addEventListener('click', abrirNuevaCategoria);
+    document.getElementById('btn-carga-masiva').addEventListener('click', abrirCargaMasiva);
+    document.getElementById('btn-plantilla-masiva').addEventListener('click', descargarPlantillaMasiva);
+    document.getElementById('btn-preview-masivo').addEventListener('click', previsualizarMasivo);
+    document.getElementById('btn-importar-masivo').addEventListener('click', importarMasivo);
+    document.getElementById('btn-guardar-cat').addEventListener('click', guardarCategoria);
+    document.getElementById('btn-tc-masiva').addEventListener('click', abrirActualizarCotizacion);
+    document.getElementById('btn-select-all-products').addEventListener('click', () => seleccionarVisibles(true));
+    document.getElementById('btn-clear-selection').addEventListener('click', limpiarSeleccion);
+    document.getElementById('btn-tc-selected').addEventListener('click', aplicarCotizacionSeleccionados);
+    document.getElementById('btn-delete-selected').addEventListener('click', eliminarSeleccionados);
+    document.getElementById('btn-aplicar-tc').addEventListener('click', aplicarCotizacionMasiva);
+    document.getElementById('btn-tc-global-aplicar').addEventListener('click', aplicarCotizacionGlobal);
+    document.getElementById('btn-tc-oficial').addEventListener('click', tomarCotizacionOnline);
+    document.getElementById('tc-auto-sync').addEventListener('change', guardarPreferenciaAutoSync);
+    document.getElementById('btn-prev-page').addEventListener('click', () => cambiarPagina(-1));
+    document.getElementById('btn-next-page').addEventListener('click', () => cambiarPagina(1));
+    document.getElementById('page-size').addEventListener('change', (e) => {
+        pageSize = Math.max(1, parseInt(e.target.value, 10) || 100);
+        paginaActual = 1;
+        filtrar();
+    });
+    document.getElementById('check-all-visible').addEventListener('change', (e) => seleccionarVisibles(e.target.checked));
+    document.getElementById('tbody').addEventListener('change', (e) => {
+        if (!e.target.classList.contains('chk-prod')) return;
+        const id = e.target.dataset.id;
+        if (!id) return;
+        if (e.target.checked) productosSeleccionados.add(id);
+        else productosSeleccionados.delete(id);
+        refrescarUISeleccion();
+    });
+    document.querySelector('.btn-menu').addEventListener('click', () => document.querySelector('.sidebar').classList.toggle('open'));
+}
+
+function seleccionarVisibles(checked) {
+    productosVisibles.forEach(p => {
+        if (!p?.id) return;
+        if (checked) productosSeleccionados.add(p.id);
+        else productosSeleccionados.delete(p.id);
+    });
+    filtrar();
+}
+
+function pauseUI() {
+    return new Promise(resolve => setTimeout(resolve, 0));
+}
+
+window.filtrarDebounced = function() {
+    if (filtroDebounceTimer) clearTimeout(filtroDebounceTimer);
+    filtroDebounceTimer = setTimeout(() => {
+        filtroDebounceTimer = null;
+        window.filtrar();
+    }, 140);
+};
+
+function limpiarSeleccion() {
+    productosSeleccionados.clear();
+    filtrar();
+}
+
+function refrescarUISeleccion() {
+    const info = document.getElementById('selection-info');
+    if (info) {
+        const n = productosSeleccionados.size;
+        info.textContent = `${n} seleccionado${n===1?'':'s'}`;
+    }
+
+    const allVisible = document.getElementById('check-all-visible');
+    if (allVisible) {
+        if (!productosVisibles.length) {
+            allVisible.checked = false;
+            allVisible.indeterminate = false;
+        } else {
+            const marcados = productosVisibles.filter(p => productosSeleccionados.has(p.id)).length;
+            allVisible.checked = marcados > 0 && marcados === productosVisibles.length;
+            allVisible.indeterminate = marcados > 0 && marcados < productosVisibles.length;
+        }
+    }
+
+    const btnTc = document.getElementById('btn-tc-selected');
+    if (btnTc) btnTc.disabled = productosSeleccionados.size === 0;
+    const btnDel = document.getElementById('btn-delete-selected');
+    if (btnDel) btnDel.disabled = productosSeleccionados.size === 0;
+}
+
+function getProductosSeleccionados() {
+    const ids = new Set(productosSeleccionados);
+    return productos.filter(p => ids.has(p.id));
+}
+
+async function aplicarCotizacionSeleccionados() {
+    const seleccionados = getProductosSeleccionados();
+    if (!seleccionados.length) {
+        toast('No hay productos seleccionados', 'wrn');
+        return;
+    }
+
+    const nuevaTc = parseFloat(document.getElementById('tc-global').value);
+    if (!nuevaTc || nuevaTc <= 0) {
+        toast('Ingresá una cotización válida en "Cotización USD global"', 'err');
+        return;
+    }
+
+    if (!ask(`¿Aplicar cotización ${nuevaTc} a ${seleccionados.length} productos seleccionados?`)) return;
+
+    const btn = document.getElementById('btn-tc-selected');
+    btn.disabled = true;
+    btn.textContent = 'Aplicando…';
+
+    let actualizados = 0;
+    let recalculados = 0;
+    let errores = 0;
+
+    let i = 0;
+    for (const p of seleccionados) {
+        if ((p.moneda_base || 'ARS') !== 'USD') continue;
+        try {
+            const update = {
+                cotizacion_usd_ars: nuevaTc,
+                updated_at: serverTimestamp(),
+            };
+            const costoUsd = parseFloat(p.precio_costo_usd) || 0;
+            if (costoUsd > 0) {
+                update.precio_costo = parseFloat((costoUsd * nuevaTc).toFixed(2));
+                recalculados++;
+            }
+            await updateDoc(doc(db,'productos',p.id), update);
+            actualizados++;
+        } catch {
+            errores++;
+        }
+        i++;
+        if (i % 20 === 0) {
+            btn.textContent = `Aplicando… ${i}/${seleccionados.length}`;
+            await pauseUI();
+        }
+    }
+
+    await guardarCotizacionGlobal(nuevaTc, 'manual-seleccionados');
+    await Promise.all([cargarProductos(), cargarHistorialCotizacion()]);
+
+    btn.textContent = 'TC a seleccionados';
+    if (errores) toast(`Aplicación parcial: ${actualizados} ok, ${errores} con error`, 'wrn');
+    else toast(`Cotización aplicada a ${actualizados} seleccionados (${recalculados} recalculados)`);
+}
+
+async function eliminarSeleccionados() {
+    const seleccionados = getProductosSeleccionados();
+    if (!seleccionados.length) {
+        toast('No hay productos seleccionados', 'wrn');
+        return;
+    }
+
+    if (!ask(`¿Eliminar ${seleccionados.length} productos seleccionados?`)) return;
+
+    const btn = document.getElementById('btn-delete-selected');
+    btn.disabled = true;
+    const prev = btn.textContent;
+    btn.textContent = 'Eliminando…';
+
+    let ok = 0;
+    let err = 0;
+    let i = 0;
+    for (const p of seleccionados) {
+        try {
+            await updateDoc(doc(db,'productos',p.id), { activo:false, updated_at: serverTimestamp() });
+            ok++;
+        } catch {
+            err++;
+        }
+        i++;
+        if (i % 20 === 0) {
+            btn.textContent = `Eliminando… ${i}/${seleccionados.length}`;
+            await pauseUI();
+        }
+    }
+
+    productosSeleccionados.clear();
+    await cargarProductos();
+    btn.textContent = prev;
+    if (err) toast(`Eliminación parcial: ${ok} ok, ${err} con error`, 'wrn');
+    else toast(`${ok} productos eliminados`, 'wrn');
+}
+
+function fechaHumana(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '—';
+    return d.toLocaleString('es-AR');
+}
+
+function refrescarInfoCotizacionGlobal() {
+    const info = document.getElementById('tc-global-info');
+    const input = document.getElementById('tc-global');
+    const chkAuto = document.getElementById('tc-auto-sync');
+    if (!info || !input) return;
+    if (chkAuto) chkAuto.checked = configFinanzas.auto_actualizar_cotizacion !== false;
+
+    const fuente = configFinanzas.fuente || 'manual';
+    const ultimaSync = configFinanzas.cotizacion_sync_at || null;
+    if (cotizacionGlobal && cotizacionGlobal > 0) {
+        input.value = cotizacionGlobal;
+        info.textContent = `Valor actual: ${money(cotizacionGlobal)} por USD | fuente: ${fuente} | sync: ${fechaHumana(ultimaSync)}`;
+    } else {
+        info.textContent = 'Sin valor configurado';
+    }
+}
+
+window.toggleMonedaBaseForm = function() {
+    const moneda = document.getElementById('f-moneda')?.value || 'ARS';
+    const tc = document.getElementById('f-tc');
+    const costoUsd = document.getElementById('f-costo-usd');
+    if (!tc || !costoUsd) return;
+
+    const usdMode = moneda === 'USD';
+    tc.disabled = !usdMode;
+    costoUsd.disabled = !usdMode;
+
+    if (!usdMode) {
+        tc.value = '0';
+        costoUsd.value = '0';
+    } else if ((parseFloat(tc.value)||0) <= 0 && cotizacionGlobal && cotizacionGlobal > 0) {
+        tc.value = cotizacionGlobal;
+    }
+    window.calcCostoArs();
+};
+
+async function cargarCotizacionGlobal() {
+    try {
+        const cfgRef = configFinanzasRef();
+        const cfgSnap = await getDoc(cfgRef);
+        configFinanzas = cfgSnap.exists() ? (cfgSnap.data() || {}) : {};
+        const desdeConfig = parseFloat(configFinanzas.cotizacion_usd_ars) || 0;
+        if (desdeConfig > 0) {
+            cotizacionGlobal = desdeConfig;
+        } else {
+            const desdeProducto = parseFloat(productos.find(p => parseFloat(p.cotizacion_usd_ars) > 0)?.cotizacion_usd_ars) || 0;
+            cotizacionGlobal = desdeProducto > 0 ? desdeProducto : null;
+        }
+        refrescarInfoCotizacionGlobal();
+    } catch {
+        configFinanzas = {};
+        refrescarInfoCotizacionGlobal();
+    }
+}
+
+async function guardarCotizacionGlobal(nuevaTc, fuente) {
+    cotizacionGlobal = nuevaTc;
+    configFinanzas = {
+        ...configFinanzas,
+        cotizacion_usd_ars: nuevaTc,
+        fuente: fuente || 'manual',
+    };
+    refrescarInfoCotizacionGlobal();
+    try {
+        await setDoc(configFinanzasRef(), {
+            empresa_id: currentEmpresaId,
+            cotizacion_usd_ars: nuevaTc,
+            fuente: fuente || 'manual',
+            updated_at: serverTimestamp(),
+            updated_by_uid: currentUser?.uid || null,
+            updated_by_email: currentUser?.email || null,
+        }, { merge: true });
+    } catch {}
+}
+
+async function guardarPreferenciaAutoSync() {
+    const chk = document.getElementById('tc-auto-sync');
+    if (!chk) return;
+    const valor = !!chk.checked;
+    configFinanzas = { ...configFinanzas, auto_actualizar_cotizacion: valor };
+    try {
+        await setDoc(configFinanzasRef(), {
+            empresa_id: currentEmpresaId,
+            auto_actualizar_cotizacion: valor,
+            updated_at: serverTimestamp(),
+        }, { merge:true });
+        toast(valor ? 'Auto actualización activada' : 'Auto actualización desactivada');
+    } catch {
+        toast('No se pudo guardar preferencia de auto actualización', 'wrn');
+    }
+    refrescarInfoCotizacionGlobal();
+}
+
+async function obtenerCotizacionOnline() {
+    const res = await fetch('https://dolarapi.com/v1/dolares/oficial', { method:'GET' });
+    if (!res.ok) throw new Error('No se pudo obtener cotización online');
+    const data = await res.json();
+    const valor = parseFloat(data?.venta || data?.promedio || data?.compra || 0);
+    if (!valor || valor <= 0) throw new Error('Respuesta sin valor válido');
+    return valor;
+}
+
+async function syncCotizacionAutomatica() {
+    const auto = configFinanzas.auto_actualizar_cotizacion !== false;
+    if (!auto) return;
+
+    const ultimaSyncIso = configFinanzas.cotizacion_sync_at || '';
+    const ms24h = 24 * 60 * 60 * 1000;
+    if (ultimaSyncIso) {
+        const t = new Date(ultimaSyncIso).getTime();
+        if (!Number.isNaN(t) && (Date.now() - t) < ms24h) return;
+    }
+
+    try {
+        const valor = await obtenerCotizacionOnline();
+        cotizacionGlobal = valor;
+        configFinanzas = {
+            ...configFinanzas,
+            cotizacion_usd_ars: valor,
+            fuente: 'online-auto',
+            cotizacion_sync_at: new Date().toISOString(),
+        };
+        await setDoc(configFinanzasRef(), {
+            empresa_id: currentEmpresaId,
+            cotizacion_usd_ars: valor,
+            fuente: 'online-auto',
+            cotizacion_sync_at: configFinanzas.cotizacion_sync_at,
+            updated_at: serverTimestamp(),
+            updated_by_uid: currentUser?.uid || null,
+            updated_by_email: currentUser?.email || null,
+        }, { merge:true });
+        refrescarInfoCotizacionGlobal();
+        toast(`Cotización auto actualizada: ${money(valor)}. Aplicala a productos cuando quieras.`);
+    } catch {
+        // Silencioso para no bloquear la pantalla si no hay internet/API.
+    }
+}
+
+// ── CARGAR ──────────────────────────────────────
+async function cargarCategorias() {
+    const snap = await getDocs(query(collection(db,'categorias'), where('empresa_id','==',currentEmpresaId), orderBy('nombre')));
+    categorias = snap.docs.map(d => ({id:d.id, ...d.data()}));
+    const selFiltro = document.getElementById('fcat');
+    const selForm = document.getElementById('f-cat');
+    if (selFiltro) selFiltro.innerHTML = '<option value="">Todas las categorías</option>';
+    if (selForm) selForm.innerHTML = '<option value="">Sin categoría</option>';
+    categorias.forEach(c => {
+        if (selFiltro) selFiltro.innerHTML += `<option value="${c.id}">${c.nombre}</option>`;
+        if (selForm) selForm.innerHTML += `<option value="${c.id}">${c.nombre}</option>`;
+    });
+}
+
+async function cargarProveedores() {
+    const snap = await getDocs(query(collection(db,'proveedores'), where('empresa_id','==',currentEmpresaId), where('activo','==',true)));
+    proveedores = snap.docs.map(d => ({id:d.id, ...d.data()}));
+    const sel = document.getElementById('f-prov');
+    if (sel) sel.innerHTML = '<option value="">Sin proveedor</option>';
+    proveedores.forEach(p => sel.innerHTML += `<option value="${p.id}">${p.nombre}</option>`);
+}
+
+function abrirNuevaCategoria() {
+    document.getElementById('cat-nombre').value = '';
+    openModal('modal-cat');
+}
+
+function abrirCargaMasiva() {
+    document.getElementById('m-carga-texto').value = '';
+    document.getElementById('m-carga-resumen').textContent = '';
+    document.getElementById('m-carga-preview').innerHTML = '';
+    openModal('modal-carga-masiva');
+}
+
+function descargarPlantillaMasiva() {
+    const encabezado = 'nombre;precio_venta;precio_costo;stock_actual;stock_minimo;codigo;categoria;proveedor;unidad;costo_usd;cotizacion_usd_ars;descripcion';
+    const ejemplo1 = 'Remera basica;15990;9000;15;5;PROD-001;Indumentaria;Proveedor X;unidad;7.50;1200;Algodon peinado';
+    const ejemplo2 = 'Pantalon jean;28990;17000;8;3;PROD-002;Indumentaria;Proveedor X;unidad;14.20;1200;Slim fit';
+    const contenido = [encabezado, ejemplo1, ejemplo2].join('\r\n');
+
+    const blob = new Blob([contenido], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `plantilla_productos_${new Date().toISOString().slice(0,10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    toast('Plantilla CSV descargada');
+}
+
+function parseLineaCarga(linea) {
+    if (linea.includes(';')) return linea.split(';').map(x => x.trim());
+    if (linea.includes('\t')) return linea.split('\t').map(x => x.trim());
+    return linea.split(',').map(x => x.trim());
+}
+
+function esc(str) {
+    return String(str||'')
+        .replace(/&/g,'&amp;')
+        .replace(/</g,'&lt;')
+        .replace(/>/g,'&gt;')
+        .replace(/"/g,'&quot;')
+        .replace(/'/g,'&#39;');
+}
+
+function numOr(defaultValue, raw) {
+    const n = parseFloat(raw);
+    return Number.isFinite(n) ? n : defaultValue;
+}
+
+function intOr(defaultValue, raw) {
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) ? n : defaultValue;
+}
+
+function findCategoriaId(ref) {
+    if (!ref) return null;
+    const normal = ref.toLowerCase();
+    const byId = categorias.find(c => c.id === ref);
+    if (byId) return byId.id;
+    const byName = categorias.find(c => (c.nombre||'').toLowerCase() === normal);
+    return byName ? byName.id : null;
+}
+
+function findProveedorId(ref) {
+    if (!ref) return null;
+    const normal = ref.toLowerCase();
+    const byId = proveedores.find(p => p.id === ref);
+    if (byId) return byId.id;
+    const byName = proveedores.find(p => (p.nombre||'').toLowerCase() === normal);
+    return byName ? byName.id : null;
+}
+
+function analizarCargaMasivaTexto() {
+    const txt = document.getElementById('m-carga-texto').value;
+    const lineas = txt.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+    if (!lineas.length) return { error: 'Pegá al menos una línea para importar', items: [] };
+
+    let filas = [...lineas];
+    const primera = parseLineaCarga(filas[0])[0]?.toLowerCase() || '';
+    if (primera === 'nombre') filas.shift();
+    if (!filas.length) return { error: 'No hay filas de datos luego del encabezado', items: [] };
+
+    const items = filas.map((linea, i) => {
+        const nLinea = i + 1;
+        const cols = parseLineaCarga(linea);
+        const [
+            nombreRaw,
+            ventaRaw,
+            costoRaw,
+            stockRaw,
+            stockMinRaw,
+            codigoRaw,
+            categoriaRaw,
+            proveedorRaw,
+            unidadRaw,
+            costoUsdRaw,
+            tcRaw,
+            descRaw,
+        ] = cols;
+
+        const nombre = (nombreRaw || '').trim();
+        const precioVenta = numOr(0, ventaRaw);
+        if (!nombre || precioVenta <= 0) {
+            return { ok:false, linea:nLinea, error:'nombre y precio_venta son obligatorios' };
+        }
+
+        const categoriaRef = (categoriaRaw || '').trim();
+        const proveedorRef = (proveedorRaw || '').trim();
+        const categoriaId = findCategoriaId(categoriaRef);
+        const proveedorId = findProveedorId(proveedorRef);
+        const avisos = [];
+        if (categoriaRef && !categoriaId) avisos.push(`Categoría no encontrada: ${categoriaRef}`);
+        if (proveedorRef && !proveedorId) avisos.push(`Proveedor no encontrado: ${proveedorRef}`);
+
+        const data = {
+            empresa_id: currentEmpresaId,
+            codigo: (codigoRaw || '').trim() || genId('PROD'),
+            nombre,
+            descripcion: (descRaw || '').trim(),
+            unidad: (unidadRaw || 'unidad').trim() || 'unidad',
+            categoria_id: categoriaId,
+            proveedor_id: proveedorId,
+            cotizacion_usd_ars: numOr(null, tcRaw),
+            precio_costo_usd: numOr(null, costoUsdRaw),
+            precio_costo: numOr(0, costoRaw),
+            precio_venta: precioVenta,
+            precio_mayorista: null,
+            stock_actual: intOr(0, stockRaw),
+            stock_minimo: intOr(5, stockMinRaw),
+            activo: true,
+            created_at: serverTimestamp(),
+            updated_at: serverTimestamp(),
+        };
+
+        if ((data.precio_costo <= 0) && data.precio_costo_usd && data.cotizacion_usd_ars) {
+            data.precio_costo = parseFloat((data.precio_costo_usd * data.cotizacion_usd_ars).toFixed(2));
+        }
+
+        return { ok:true, linea:nLinea, data, avisos };
+    });
+
+    return { error:null, items };
+}
+
+function previsualizarMasivo() {
+    const resumen = document.getElementById('m-carga-resumen');
+    const preview = document.getElementById('m-carga-preview');
+    const analisis = analizarCargaMasivaTexto();
+    if (analisis.error) {
+        preview.innerHTML = '';
+        resumen.textContent = analisis.error;
+        toast(analisis.error, 'err');
+        return;
+    }
+
+    const ok = analisis.items.filter(x => x.ok);
+    const invalidas = analisis.items.filter(x => !x.ok);
+    const conAviso = ok.filter(x => x.avisos.length).length;
+
+    resumen.innerHTML = `Previsualización: <strong>${ok.length}</strong> válidas | <strong>${invalidas.length}</strong> inválidas | <strong>${conAviso}</strong> con aviso`;
+
+    const filas = analisis.items.slice(0, 30).map(it => {
+        if (!it.ok) {
+            return `<tr>
+                <td>${it.linea}</td>
+                <td colspan="4"><span class="badge b-danger">Inválida</span> ${esc(it.error)}</td>
+            </tr>`;
+        }
+        const estado = it.avisos.length ? '<span class="badge b-warn">Aviso</span>' : '<span class="badge b-ok">OK</span>';
+        return `<tr>
+            <td>${it.linea}</td>
+            <td>${esc(it.data.codigo)}</td>
+            <td>${esc(it.data.nombre)}</td>
+            <td style="font-family:'DM Mono',monospace">${money(it.data.precio_venta)}</td>
+            <td>${estado}${it.avisos.length ? ` <span style="color:var(--muted)">${esc(it.avisos.join(' | '))}</span>` : ''}</td>
+        </tr>`;
+    }).join('');
+
+    preview.innerHTML = `
+        <div class="table-wrap" style="max-height:220px;border:1px solid var(--border);border-radius:8px">
+            <table>
+                <thead><tr><th>Línea</th><th>Código</th><th>Nombre</th><th>P. Venta</th><th>Estado</th></tr></thead>
+                <tbody>${filas || '<tr><td colspan="5" style="color:var(--muted)">Sin filas para mostrar</td></tr>'}</tbody>
+            </table>
+        </div>
+        ${analisis.items.length > 30 ? `<div style="margin-top:6px;font-size:11px;color:var(--muted)">Mostrando 30 de ${analisis.items.length} filas.</div>` : ''}
+    `;
+}
+
+async function importarMasivo() {
+    const resumen = document.getElementById('m-carga-resumen');
+    const preview = document.getElementById('m-carga-preview');
+    const btn = document.getElementById('btn-importar-masivo');
+    const analisis = analizarCargaMasivaTexto();
+    if (analisis.error) {
+        toast(analisis.error, 'err');
+        return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = 'Importando…';
+    resumen.textContent = 'Importando filas válidas…';
+
+    let creados = 0;
+    let omitidos = analisis.items.filter(x => !x.ok).length;
+    let errores = 0;
+    const erroresDetalle = [];
+
+    let i = 0;
+    const total = analisis.items.length;
+    for (const item of analisis.items) {
+        if (!item.ok) {
+            erroresDetalle.push(`Línea ${item.linea}: ${item.error}`);
+            continue;
+        }
+        try {
+            await addDoc(collection(db,'productos'), item.data);
+            creados++;
+        } catch (e) {
+            errores++;
+            erroresDetalle.push(`Línea ${item.linea}: ${e.message}`);
+        }
+        i++;
+        if (i % 25 === 0) {
+            btn.textContent = `Importando… ${i}/${total}`;
+            resumen.textContent = `Importando filas válidas… ${i}/${total}`;
+            await pauseUI();
+        }
+    }
+
+    btn.disabled = false;
+    btn.textContent = 'Importar';
+
+    resumen.innerHTML = `Creados: <strong>${creados}</strong> | Omitidos: <strong>${omitidos}</strong> | Errores: <strong>${errores}</strong>`;
+    if (erroresDetalle.length) {
+        const vista = erroresDetalle.slice(0, 6).join('<br>');
+        resumen.innerHTML += `<br><span style="color:var(--warning)">${vista}${erroresDetalle.length>6?'<br>…':''}</span>`;
+    }
+    if (preview) preview.innerHTML = '';
+
+    await cargarProductos();
+
+    if (creados > 0 && errores === 0 && omitidos === 0) {
+        closeModal('modal-carga-masiva');
+        toast(`Importación completada: ${creados} productos`);
+    } else if (creados > 0) {
+        toast(`Importación parcial: ${creados} creados`, 'wrn');
+    } else {
+        toast('No se pudo importar ningún producto', 'err');
+    }
+}
+
+async function guardarCategoria() {
+    const nombre = document.getElementById('cat-nombre').value.trim();
+    if (!nombre) { toast('El nombre de categoría es obligatorio','err'); return; }
+
+    const btn = document.getElementById('btn-guardar-cat');
+    btn.disabled = true;
+    btn.textContent = 'Guardando…';
+    try {
+        await addDoc(collection(db,'categorias'), {
+            empresa_id: currentEmpresaId,
+            nombre,
+            created_at: serverTimestamp(),
+            updated_at: serverTimestamp(),
+        });
+        await cargarCategorias();
+        closeModal('modal-cat');
+        toast('Categoría creada');
+    } catch (e) {
+        toast('Error al crear categoría: ' + e.message, 'err');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Guardar categoría';
+    }
+}
+
+function abrirActualizarCotizacion() {
+    const ultima = cotizacionGlobal || productos.find(p => parseFloat(p.cotizacion_usd_ars) > 0)?.cotizacion_usd_ars || '';
+    document.getElementById('m-tc').value = ultima;
+    openModal('modal-tc');
+}
+
+async function aplicarCotizacionEnTodos(nuevaTc) {
+    let actualizados = 0;
+    let recalculados = 0;
+    let errores = 0;
+
+    let i = 0;
+    for (const p of productos) {
+        if ((p.moneda_base || 'ARS') !== 'USD') continue;
+        try {
+            const update = {
+                cotizacion_usd_ars: nuevaTc,
+                updated_at: serverTimestamp(),
+            };
+            const costoUsd = parseFloat(p.precio_costo_usd) || 0;
+            if (costoUsd > 0) {
+                update.precio_costo = parseFloat((costoUsd * nuevaTc).toFixed(2));
+                recalculados++;
+            }
+            await updateDoc(doc(db,'productos',p.id), update);
+            actualizados++;
+        } catch {
+            errores++;
+        }
+        i++;
+        if (i % 25 === 0) await pauseUI();
+    }
+
+    try {
+        await addDoc(collection(db,'cotizaciones_historial'), {
+            empresa_id: currentEmpresaId,
+            cotizacion: nuevaTc,
+            cantidad_actualizados: actualizados,
+            recalculados,
+            errores,
+            usuario_uid: currentUser?.uid || null,
+            usuario_email: currentUser?.email || null,
+            created_at: serverTimestamp(),
+        });
+    } catch {}
+
+    await guardarCotizacionGlobal(nuevaTc, 'manual');
+    await Promise.all([cargarProductos(), cargarHistorialCotizacion()]);
+    return { actualizados, recalculados, errores };
+}
+
+async function aplicarCotizacionGlobal() {
+    const nuevaTc = parseFloat(document.getElementById('tc-global').value);
+    if (!nuevaTc || nuevaTc <= 0) {
+        toast('Ingresá una cotización válida', 'err');
+        return;
+    }
+    if (!ask(`¿Aplicar cotización ${nuevaTc} a ${productos.length} productos activos?`)) return;
+    const btn = document.getElementById('btn-tc-global-aplicar');
+    btn.disabled = true;
+    btn.textContent = 'Aplicando…';
+    const r = await aplicarCotizacionEnTodos(nuevaTc);
+    btn.disabled = false;
+    btn.textContent = 'Aplicar a todos';
+    if (r.errores) toast(`Cotización aplicada parcial: ${r.actualizados} ok, ${r.errores} con error`, 'wrn');
+    else toast(`Cotización aplicada: ${r.actualizados} productos (${r.recalculados} recalculados)`);
+}
+
+async function tomarCotizacionOnline() {
+    const btn = document.getElementById('btn-tc-oficial');
+    btn.disabled = true;
+    btn.textContent = 'Consultando…';
+    try {
+        const valor = await obtenerCotizacionOnline();
+        document.getElementById('tc-global').value = valor.toFixed(2);
+        configFinanzas = { ...configFinanzas, cotizacion_sync_at: new Date().toISOString() };
+        await guardarCotizacionGlobal(valor, 'online');
+        await setDoc(configFinanzasRef(), {
+            empresa_id: currentEmpresaId,
+            cotizacion_sync_at: configFinanzas.cotizacion_sync_at,
+            updated_at: serverTimestamp(),
+        }, { merge:true });
+        toast(`Cotización cargada: ${money(valor)}. Ahora podés aplicar a todos.`);
+    } catch {
+        toast('No se pudo consultar online. Usá referencia BCRA y cargala manualmente.', 'wrn');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Tomar oficial (online)';
+    }
+}
+
+async function aplicarCotizacionMasiva() {
+    const nuevaTc = parseFloat(document.getElementById('m-tc').value);
+    if (!nuevaTc || nuevaTc <= 0) {
+        toast('Ingresá una cotización válida', 'err');
+        return;
+    }
+    if (!ask(`¿Aplicar cotización ${nuevaTc} a ${productos.length} productos activos?`)) return;
+
+    const btn = document.getElementById('btn-aplicar-tc');
+    btn.disabled = true;
+    btn.textContent = 'Aplicando…';
+
+    const r = await aplicarCotizacionEnTodos(nuevaTc);
+
+    btn.disabled = false;
+    btn.textContent = 'Aplicar cotización';
+
+    closeModal('modal-tc');
+    if (r.errores) {
+        toast(`Cotización aplicada parcial: ${r.actualizados} ok, ${r.errores} con error`, 'wrn');
+    } else {
+        toast(`Cotización aplicada: ${r.actualizados} productos (${r.recalculados} con costo recalculado)`);
+    }
+}
+
+async function cargarProductos() {
+    const snap = await getDocs(query(collection(db,'productos'), where('empresa_id','==',currentEmpresaId), where('activo','==',true)));
+    productos = snap.docs
+        .map(d => ({id:d.id, ...d.data()}))
+        .sort((a,b) => (a.nombre||'').localeCompare((b.nombre||''), 'es', { sensitivity:'base' }));
+
+    productos = productos.map(p => {
+        const marca = inferMarcaProducto(p);
+        const search = `${(p.nombre||'').toLowerCase()} ${(p.codigo||'').toLowerCase()} ${marca.toLowerCase()}`;
+        return { ...p, _marca: marca, _search: search };
+    });
+
+    refrescarFiltroMarcas();
+
+    const idsActuales = new Set(productos.map(p => p.id));
+    productosSeleccionados = new Set([...productosSeleccionados].filter(id => idsActuales.has(id)));
+
+    actualizarStats();
+    filtrar();
+}
+
+async function cargarHistorialCotizacion() {
+    const tbody = document.getElementById('tbody-hist-tc');
+    if (!tbody) return;
+    try {
+        const snap = await getDocs(query(collection(db,'cotizaciones_historial'), where('empresa_id','==',currentEmpresaId), orderBy('created_at','desc'), limit(10)));
+        const lista = snap.docs.map(d => ({id:d.id, ...d.data()}));
+        if (!lista.length) {
+            tbody.innerHTML = `<tr><td colspan="5"><div class="empty" style="padding:16px 12px"><p>Sin historial aún</p></div></td></tr>`;
+            return;
+        }
+        tbody.innerHTML = lista.map(h => {
+            const fecha = h.created_at?.toDate ? h.created_at.toDate().toLocaleString('es-AR') : '—';
+            return `<tr>
+                <td style="color:var(--muted)">${fecha}</td>
+                <td><span class="chip">${money(h.cotizacion||0)}</span></td>
+                <td>${h.usuario_email||'—'}</td>
+                <td>${h.cantidad_actualizados||0}</td>
+                <td>${h.recalculados||0}</td>
+            </tr>`;
+        }).join('');
+    } catch {
+        tbody.innerHTML = `<tr><td colspan="5"><div class="empty" style="padding:16px 12px"><p>No se pudo cargar el historial</p></div></td></tr>`;
+    }
+}
+
+// ── STATS ────────────────────────────────────────
+function actualizarStats() {
+    document.getElementById('s-total').textContent = productos.length;
+    const bajo  = productos.filter(p => p.stock_actual <= p.stock_minimo).length;
+    const valor = productos.reduce((a,p) => a + (p.stock_actual||0)*(p.precio_costo||0), 0);
+    document.getElementById('s-bajo').textContent  = bajo;
+    document.getElementById('s-valor').textContent = money(valor);
+}
+
+function inferMarcaProducto(p) {
+    if (p?._marca) return p._marca;
+    const directa = (p?.marca || '').trim();
+    if (directa) return directa;
+
+    const codigo = (p?.codigo || '').toUpperCase().trim();
+    const nombre = (p?.nombre || '').toUpperCase();
+
+    const marcasConocidas = ['HIKVISION','HIK','DAHUA','LONGSE','IMOU','TYCO','FOSCAM','GARNET','RISCO','DSC','AJAX','BOSCH'];
+    for (const m of marcasConocidas) {
+        if (codigo.startsWith(m + '-') || nombre.includes(m)) return m;
+    }
+
+    if (codigo.includes('-')) {
+        const pref = codigo.split('-')[0].trim();
+        if (/^[A-Z0-9]{2,8}$/.test(pref)) return pref;
+    }
+
+    return '';
+}
+
+function refrescarFiltroMarcas() {
+    const sel = document.getElementById('fmarca');
+    if (!sel) return;
+
+    const prev = sel.value;
+    const marcas = [...new Set(productos.map(inferMarcaProducto).filter(Boolean))]
+        .sort((a,b) => a.localeCompare(b, 'es', { sensitivity:'base' }));
+
+    sel.innerHTML = '<option value="">Todas las marcas</option>';
+    marcas.forEach(m => {
+        sel.innerHTML += `<option value="${esc(m)}">${esc(m)}</option>`;
+    });
+
+    if (prev && marcas.includes(prev)) sel.value = prev;
+}
+
+function refrescarResumenMarcas(lista) {
+    const box = document.getElementById('marca-resumen');
+    if (!box) return;
+
+    if (!lista.length) {
+        box.innerHTML = `<span style="font-size:12px;color:var(--muted)">Sin datos para resumen por marca</span>`;
+        return;
+    }
+
+    const map = {};
+    lista.forEach(p => {
+        const marca = inferMarcaProducto(p) || 'Sin marca';
+        if (!map[marca]) map[marca] = { marca, cantidad: 0, valor: 0 };
+        map[marca].cantidad += 1;
+        map[marca].valor += (parseFloat(p.stock_actual) || 0) * (parseFloat(p.precio_costo) || 0);
+    });
+
+    const top = Object.values(map)
+        .sort((a,b) => (b.cantidad - a.cantidad) || (b.valor - a.valor))
+        .slice(0, 10);
+
+    box.innerHTML = top.map(it => `
+        <div class="chip" style="display:flex;gap:6px;align-items:center;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+            <strong>${esc(it.marca)}</strong>
+            <span style="color:var(--muted)">${it.cantidad} prod</span>
+            <span style="color:var(--muted)">${money(it.valor)}</span>
+        </div>
+    `).join('');
+}
+
+function cambiarPagina(delta) {
+    paginaActual = Math.max(1, paginaActual + delta);
+    filtrar();
+}
+
+function refrescarPaginacion(totalFiltrados, totalPaginas) {
+    const info = document.getElementById('pag-info');
+    if (info) info.textContent = `${totalFiltrados} producto${totalFiltrados!==1?'s':''} | Página ${paginaActual}/${totalPaginas}`;
+    const prev = document.getElementById('btn-prev-page');
+    const next = document.getElementById('btn-next-page');
+    if (prev) prev.disabled = paginaActual <= 1;
+    if (next) next.disabled = paginaActual >= totalPaginas;
+}
+
+// ── FILTRAR / RENDER ─────────────────────────────
+window.filtrar = function() {
+    const busca  = document.getElementById('busca').value.toLowerCase();
+    const cat    = document.getElementById('fcat').value;
+    const moneda = document.getElementById('fmoneda').value;
+    const marcaSel = document.getElementById('fmarca').value;
+    const stkbaj = document.getElementById('fstock').checked;
+
+    let lista = productos.filter(p => {
+        const baseMoneda = p.moneda_base || 'ARS';
+        const marca = (p._marca || inferMarcaProducto(p)).toLowerCase();
+        const ok1 = !busca || (p._search || '').includes(busca);
+        const ok2 = !cat || p.categoria_id === cat;
+        const ok3 = !moneda || baseMoneda === moneda;
+        const ok4 = !marcaSel || (p._marca || inferMarcaProducto(p)) === marcaSel;
+        const ok5 = !stkbaj || p.stock_actual <= p.stock_minimo;
+        return ok1 && ok2 && ok3 && ok4 && ok5;
+    });
+
+    productosFiltrados = lista;
+    refrescarResumenMarcas(lista);
+
+    const totalFiltrados = lista.length;
+    const totalPaginas = Math.max(1, Math.ceil(totalFiltrados / pageSize));
+    if (paginaActual > totalPaginas) paginaActual = totalPaginas;
+
+    const desde = (paginaActual - 1) * pageSize;
+    const hasta = desde + pageSize;
+    const listaPagina = lista.slice(desde, hasta);
+    productosVisibles = listaPagina;
+
+    const tbody = document.getElementById('tbody');
+    refrescarPaginacion(totalFiltrados, totalPaginas);
+
+    if (!listaPagina.length) {
+        tbody.innerHTML = `<tr><td colspan="8"><div class="empty"><div class="eicon">▦</div><p>No se encontraron productos</p></div></td></tr>`;
+        refrescarUISeleccion();
+        return;
+    }
+
+    tbody.innerHTML = listaPagina.map(p => {
+        const monedaBase = p.moneda_base || 'ARS';
+        const marca = p._marca || inferMarcaProducto(p);
+        const stockCero = p.stock_actual <= 0;
+        const stockBaj  = !stockCero && p.stock_actual <= p.stock_minimo;
+        const tc = parseFloat(p.cotizacion_usd_ars)||0;
+        const costoArs = parseFloat(p.precio_costo)||0;
+        const costoUsd = parseFloat(p.precio_costo_usd) || 0;
+        const ventaArs = parseFloat(p.precio_venta)||0;
+        const ventaUsd = (monedaBase === 'USD' && tc>0) ? (ventaArs/tc) : 0;
+        const ventaMain = (monedaBase === 'USD' && ventaUsd > 0) ? usd(ventaUsd) : `ARS ${money(ventaArs)}`;
+        const ventaSub = (monedaBase === 'USD')
+            ? `ARS ${money(ventaArs)}`
+            : 'ARS (base)';
+        const costoMain = (monedaBase === 'USD' && costoUsd > 0) ? usd(costoUsd) : `ARS ${money(costoArs)}`;
+        const costoSub = (monedaBase === 'USD')
+            ? `ARS ${money(costoArs)}`
+            : 'ARS (base)';
+        const badge = stockCero
+            ? `<span class="badge b-danger">Sin stock (0)</span>`
+            : stockBaj
+                ? `<span class="badge b-warn">Bajo (${p.stock_actual})</span>`
+                : `<span class="badge b-ok">OK (${p.stock_actual})</span>`;
+
+        return `<tr>
+            <td><input type="checkbox" class="chk-prod" data-id="${p.id}" ${productosSeleccionados.has(p.id) ? 'checked' : ''}></td>
+            <td><span class="chip">${p.codigo||'—'}</span></td>
+            <td>
+                <div style="font-weight:500">${p.nombre}</div>
+                <div style="font-size:11px;color:var(--muted)">Base ${monedaBase}${marca ? ` | Marca ${marca}` : ''}</div>
+                ${p.descripcion?`<div style="font-size:11px;color:var(--muted)">${p.descripcion}</div>`:''}
+            </td>
+            <td>${categorias.find(c=>c.id===p.categoria_id)?.nombre||'<span style="color:var(--muted)">—</span>'}</td>
+            <td>
+                <div style="font-family:'DM Mono',monospace;font-weight:600">${ventaMain}</div>
+                <div style="font-size:11px;color:var(--muted)">${ventaSub}</div>
+            </td>
+            <td>
+                <div style="font-family:'DM Mono',monospace;color:var(--text)">${costoMain}</div>
+                <div style="font-size:11px;color:var(--muted)">${costoSub}</div>
+            </td>
+            <td>${badge}</td>
+            <td>
+                <div style="display:flex;gap:5px">
+                    <button class="btn btn-ghost btn-sm" onclick="window.editar('${p.id}')">✎</button>
+                    <button class="btn btn-danger btn-sm" onclick="window.eliminar('${p.id}','${p.nombre.replace(/'/g,"\\'")}')">✕</button>
+                </div>
+            </td>
+        </tr>`;
+    }).join('');
+
+    refrescarUISeleccion();
+};
+
+// ── MARGEN ────────────────────────────────────────
+window.calcMargen = function() {
+    const costo = parseFloat(document.getElementById('f-costo').value)||0;
+    const venta = parseFloat(document.getElementById('f-venta').value)||0;
+    const el = document.getElementById('margen');
+    if (costo>0 && venta>0) {
+        const pct = ((venta-costo)/costo*100).toFixed(1);
+        el.textContent = pct+'%';
+        el.style.color = pct>=0 ? 'var(--success)' : 'var(--danger)';
+    } else { el.textContent = '—'; }
+};
+
+window.calcCostoArs = function() {
+    const tc = parseFloat(document.getElementById('f-tc').value)||0;
+    const costoUsd = parseFloat(document.getElementById('f-costo-usd').value)||0;
+    if (tc > 0 && costoUsd > 0) {
+        document.getElementById('f-costo').value = (tc * costoUsd).toFixed(2);
+    }
+};
+
+// ── FORMULARIO ────────────────────────────────────
+function abrirNuevo() {
+    editId = null;
+    document.getElementById('modal-title').textContent = 'Nuevo producto';
+    ['f-codigo','f-nombre','f-desc','f-mayor'].forEach(id => document.getElementById(id).value='');
+    document.getElementById('f-unidad').value='unidad';
+    document.getElementById('f-moneda').value='ARS';
+    document.getElementById('f-cat').value='';
+    document.getElementById('f-prov').value='';
+    document.getElementById('f-tc').value = cotizacionGlobal && cotizacionGlobal > 0 ? cotizacionGlobal : '0';
+    document.getElementById('f-costo-usd').value='0';
+    document.getElementById('f-costo').value='0';
+    document.getElementById('f-venta').value='';
+    document.getElementById('f-stock').value='0';
+    document.getElementById('f-stockmin').value='5';
+    document.getElementById('margen').textContent='—';
+    window.toggleMonedaBaseForm();
+    openModal('modal-prod');
+}
+
+window.editar = function(id) {
+    const p = productos.find(x=>x.id===id);
+    if (!p) return;
+    editId = id;
+    document.getElementById('modal-title').textContent = 'Editar producto';
+    document.getElementById('f-codigo').value   = p.codigo||'';
+    document.getElementById('f-nombre').value   = p.nombre||'';
+    document.getElementById('f-desc').value     = p.descripcion||'';
+    document.getElementById('f-unidad').value   = p.unidad||'unidad';
+    document.getElementById('f-moneda').value   = p.moneda_base || ((parseFloat(p.precio_costo_usd)||0) > 0 ? 'USD' : 'ARS');
+    document.getElementById('f-cat').value      = p.categoria_id||'';
+    document.getElementById('f-prov').value     = p.proveedor_id||'';
+    document.getElementById('f-tc').value       = p.cotizacion_usd_ars||0;
+    document.getElementById('f-costo-usd').value= p.precio_costo_usd || ((p.cotizacion_usd_ars>0 && p.precio_costo>0) ? (p.precio_costo/p.cotizacion_usd_ars).toFixed(2) : 0);
+    document.getElementById('f-costo').value    = p.precio_costo||0;
+    document.getElementById('f-venta').value    = p.precio_venta||0;
+    document.getElementById('f-mayor').value    = p.precio_mayorista||'';
+    document.getElementById('f-stock').value    = p.stock_actual||0;
+    document.getElementById('f-stockmin').value = p.stock_minimo||5;
+    window.toggleMonedaBaseForm();
+    window.calcMargen();
+    openModal('modal-prod');
+};
+
+async function guardar() {
+    const nombre = document.getElementById('f-nombre').value.trim();
+    const venta  = parseFloat(document.getElementById('f-venta').value);
+    if (!nombre) { toast('El nombre es obligatorio','err'); return; }
+    if (!venta)  { toast('El precio de venta es obligatorio','err'); return; }
+
+    const btn = document.getElementById('btn-guardar');
+    btn.disabled = true; btn.textContent = 'Guardando…';
+
+    const monedaBase = document.getElementById('f-moneda').value || 'ARS';
+    const tcInput = parseFloat(document.getElementById('f-tc').value) || 0;
+    const tcFinal = tcInput > 0 ? tcInput : (cotizacionGlobal || null);
+
+    const data = {
+        empresa_id:        currentEmpresaId,
+        codigo:           document.getElementById('f-codigo').value.trim() || genId('PROD'),
+        nombre,
+        moneda_base:      monedaBase,
+        descripcion:      document.getElementById('f-desc').value.trim(),
+        unidad:           document.getElementById('f-unidad').value,
+        categoria_id:     document.getElementById('f-cat').value || null,
+        proveedor_id:     document.getElementById('f-prov').value || null,
+        cotizacion_usd_ars: monedaBase === 'USD' ? tcFinal : null,
+        precio_costo_usd: monedaBase === 'USD' ? (parseFloat(document.getElementById('f-costo-usd').value)||null) : null,
+        precio_costo:     parseFloat(document.getElementById('f-costo').value)||0,
+        precio_venta:     venta,
+        precio_mayorista: parseFloat(document.getElementById('f-mayor').value)||null,
+        stock_actual:     parseInt(document.getElementById('f-stock').value)||0,
+        stock_minimo:     parseInt(document.getElementById('f-stockmin').value)||5,
+        activo:           true,
+        updated_at:       serverTimestamp(),
+    };
+
+    try {
+        if (editId) {
+            await updateDoc(doc(db,'productos',editId), data);
+            toast('Producto actualizado');
+        } else {
+            data.created_at = serverTimestamp();
+            await addDoc(collection(db,'productos'), data);
+            toast('Producto creado');
+        }
+        closeModal('modal-prod');
+        await cargarProductos();
+    } catch(e) {
+        toast('Error al guardar: '+e.message,'err');
+    } finally {
+        btn.disabled=false; btn.textContent='Guardar';
+    }
+}
+
+window.eliminar = async function(id, nombre) {
+    if (!ask(`¿Eliminar "${nombre}"?`)) return;
+    try {
+        await updateDoc(doc(db,'productos',id), { activo:false });
+        toast('Producto eliminado','wrn');
+        await cargarProductos();
+    } catch(e) { toast('Error: '+e.message,'err'); }
+};
+
+</script>
+</body>
+</html>

@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Usuarios - GestionPro</title>
+    <link rel="stylesheet" href="css/style.css">
+    <style>
+        .pw-wrap { position:relative; }
+        .pw-wrap .inp { padding-right:78px; }
+        .pw-btn {
+            position:absolute;
+            right:8px;
+            top:50%;
+            transform:translateY(-50%);
+            border:none;
+            background:transparent;
+            color:var(--muted);
+            font-size:12px;
+            font-weight:600;
+            cursor:pointer;
+            padding:2px 4px;
+        }
+    </style>
+</head>
+<body>
+<div id="app"></div>
+<div id="toasts"></div>
+
+<script type="module">
+import { auth, db, firebaseConfig } from './js/firebase-config.js';
+import { onAuthStateChanged, signOut, getAuth, createUserWithEmailAndPassword } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { initializeApp, deleteApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { collection, doc, getDoc, getDocs, setDoc, updateDoc, query, where, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-lite.js";
+import { renderSidebar } from './js/sidebar.js';
+import { toast, ask } from './js/utils.js';
+import { ensureUserActive } from './js/access-control.js';
+import { ensureRoleAllowed } from './js/access-control.js';
+import { getEmpresaId } from './js/access-control.js';
+
+let usuarios = [];
+let currentUser = null;
+let currentPerfil = null;
+let currentEmpresaId = null;
+
+onAuthStateChanged(auth, async (user) => {
+    if (!user) { window.location.href = 'login.html'; return; }
+    if (!(await ensureUserActive(auth, db, user))) return;
+    if (!(await ensureRoleAllowed(db, user, ['admin']))) return;
+
+    try {
+        currentUser = user;
+        currentEmpresaId = getEmpresaId() || user.uid;
+        renderApp(user);
+        await asegurarPerfilActual(user);
+        await cargarUsuarios();
+    } catch (e) {
+        console.error('Error iniciando Usuarios:', e);
+        toast('Error al cargar usuarios', 'err');
+    }
+});
+
+function renderApp(user) {
+    document.getElementById('app').innerHTML = `
+        ${renderSidebar('usuarios')}
+        <main class="main">
+            <header class="topbar">
+                <div style="display:flex;align-items:center;gap:10px">
+                    <button class="btn btn-ghost btn-sm btn-menu">☰</button>
+                    <span class="topbar-title">Usuarios</span>
+                </div>
+                <button class="btn btn-primary" id="btn-nuevo">+ Nuevo usuario</button>
+            </header>
+            <div class="page">
+                <div class="card" style="margin-bottom:14px">
+                    <div class="card-header">
+                        <h2>Administracion</h2>
+                    </div>
+                    <div style="padding:12px;font-size:12px;color:var(--muted)">
+                        Crea accesos con email y contrasena para el sistema. Cada usuario queda guardado en Authentication y en la coleccion <code>usuarios</code>.
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Listado de usuarios</h2>
+                        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                            <input class="inp inp-search" id="busca" placeholder="Buscar por email, nombre o rol" oninput="window.filtrarUsuarios()" style="max-width:280px">
+                            <select class="inp" id="f-rol-lista" onchange="window.filtrarUsuarios()" style="width:auto">
+                                <option value="">Todos los roles</option>
+                                <option value="admin">Administrador</option>
+                                <option value="ventas">Comercial</option>
+                                <option value="operador">Operador</option>
+                            </select>
+                            <select class="inp" id="f-estado-lista" onchange="window.filtrarUsuarios()" style="width:auto">
+                                <option value="">Todos los estados</option>
+                                <option value="activo">Activos</option>
+                                <option value="inactivo">Inactivos</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="table-wrap">
+                        <table>
+                            <thead><tr><th>Nombre</th><th>Email</th><th>Rol</th><th>Estado</th><th>Alta</th><th>Acciones</th></tr></thead>
+                            <tbody id="tbody-usuarios"></tbody>
+                        </table>
+                    </div>
+                    <div class="pag"><span id="pag-info">-</span></div>
+                </div>
+            </div>
+        </main>
+
+        <div class="overlay" id="modal-usuario">
+            <div class="modal" style="max-width:580px">
+                <div class="modal-head">
+                    <h3>Nuevo usuario</h3>
+                    <button class="btn btn-ghost btn-sm" id="btn-close-modal">✕</button>
+                </div>
+                <div class="modal-body">
+                    <div class="form-grid">
+                        <div class="fgroup full"><label>Nombre *</label><input class="inp" id="f-nombre" placeholder="Ej: Juan Perez"></div>
+                        <div class="fgroup full"><label>Email *</label><input class="inp" id="f-email" type="email" placeholder="usuario@empresa.com"></div>
+                        <div class="fgroup"><label>Contrasena *</label>
+                            <div class="pw-wrap">
+                                <input class="inp" id="f-pass" type="password" placeholder="Minimo 6 caracteres">
+                                <button type="button" class="pw-btn" id="f-pass-toggle" aria-label="Mostrar contraseña">Mostrar</button>
+                            </div>
+                        </div>
+                        <div class="fgroup"></div>
+                        <div class="fgroup"><label>Rol</label>
+                            <select class="inp" id="f-rol">
+                                <option value="admin">Admin</option>
+                                <option value="ventas">Ventas</option>
+                                <option value="operador">Operador</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-foot">
+                    <button class="btn btn-ghost" id="btn-cancelar">Cancelar</button>
+                    <button class="btn btn-primary" id="btn-guardar">Crear usuario</button>
+                </div>
+            </div>
+        </div>`;
+
+    document.getElementById('btn-logout').addEventListener('click', () => signOut(auth).then(() => location.href='login.html'));
+    document.getElementById('user-name').textContent = user.email;
+    document.getElementById('user-avatar').textContent = user.email[0].toUpperCase();
+    document.querySelector('.btn-menu').addEventListener('click', () => document.querySelector('.sidebar').classList.toggle('open'));
+
+    document.getElementById('btn-nuevo').addEventListener('click', () => openModal('modal-usuario'));
+    document.getElementById('btn-cancelar').addEventListener('click', () => closeModal('modal-usuario'));
+    document.getElementById('btn-close-modal').addEventListener('click', () => closeModal('modal-usuario'));
+    document.getElementById('btn-guardar').addEventListener('click', crearUsuario);
+    document.getElementById('f-pass-toggle').addEventListener('click', togglePasswordUsuario);
+}
+
+function togglePasswordUsuario() {
+    const input = document.getElementById('f-pass');
+    const btn = document.getElementById('f-pass-toggle');
+    if (!input || !btn) return;
+    const visible = input.type === 'text';
+    input.type = visible ? 'password' : 'text';
+    btn.textContent = visible ? 'Mostrar' : 'Ocultar';
+    btn.setAttribute('aria-label', visible ? 'Mostrar contraseña' : 'Ocultar contraseña');
+}
+
+async function asegurarPerfilActual(user) {
+    const ref = doc(db, 'usuarios', user.uid);
+    const snap = await getDoc(ref);
+
+    if (!snap.exists()) {
+        await setDoc(ref, {
+            nombre: user.email?.split('@')[0] || 'Administrador',
+            email: user.email || '',
+            rol: 'admin',
+            activo: true,
+            empresa_id: currentEmpresaId,
+            created_at: serverTimestamp(),
+            updated_at: serverTimestamp(),
+            creado_por: user.uid,
+        }, { merge: true });
+    } else {
+        const data = snap.data() || {};
+        if (!data.empresa_id) {
+            await setDoc(ref, { empresa_id: currentEmpresaId, updated_at: serverTimestamp() }, { merge: true });
+        }
+    }
+
+    const snap2 = await getDoc(ref);
+    currentPerfil = snap2.exists() ? snap2.data() : null;
+
+    if ((currentPerfil?.rol || 'admin') !== 'admin') {
+        document.getElementById('btn-nuevo').disabled = true;
+        document.getElementById('btn-nuevo').title = 'Solo administradores pueden crear usuarios';
+        toast('Tu usuario no tiene permisos de administrador', 'wrn');
+    }
+}
+
+async function cargarUsuarios() {
+    const snap = await getDocs(query(collection(db, 'usuarios'), where('empresa_id', '==', currentEmpresaId)));
+    usuarios = snap.docs
+        .map(d => ({ id: d.id, ...d.data() }))
+        .sort((a,b) => {
+            const ta = a.created_at?.toDate ? a.created_at.toDate().getTime() : 0;
+            const tb = b.created_at?.toDate ? b.created_at.toDate().getTime() : 0;
+            return tb - ta;
+        });
+    filtrarUsuarios();
+}
+
+window.filtrarUsuarios = filtrarUsuarios;
+function filtrarUsuarios() {
+    const q = (document.getElementById('busca')?.value || '').toLowerCase().trim();
+    const rolFiltro = (document.getElementById('f-rol-lista')?.value || '').toLowerCase().trim();
+    const estadoFiltro = (document.getElementById('f-estado-lista')?.value || '').toLowerCase().trim();
+    const tbody = document.getElementById('tbody-usuarios');
+    if (!tbody) return;
+
+    const lista = usuarios.filter(u => {
+        const rol = (u.rol || 'operador').toLowerCase();
+        const okRol = !rolFiltro || rol === rolFiltro;
+        const estado = u.activo === false ? 'inactivo' : 'activo';
+        const okEstado = !estadoFiltro || estado === estadoFiltro;
+        const okBusca = !q || (u.nombre || '').toLowerCase().includes(q)
+            || (u.email || '').toLowerCase().includes(q)
+            || (u.rol || '').toLowerCase().includes(q);
+        return okRol && okEstado && okBusca;
+    });
+
+    document.getElementById('pag-info').textContent = `${lista.length} usuario${lista.length !== 1 ? 's' : ''}`;
+
+    if (!lista.length) {
+        tbody.innerHTML = `<tr><td colspan="6"><div class="empty"><div class="eicon">◌</div><p>No hay usuarios</p></div></td></tr>`;
+        return;
+    }
+
+    const roleBadgeClass = (rol) => {
+        const r = (rol || 'operador').toLowerCase();
+        if (r === 'admin') return 'b-ok';
+        if (r === 'ventas') return 'b-info';
+        return 'b-gray';
+    };
+
+    const roleLabel = (rol) => {
+        const r = (rol || 'operador').toLowerCase();
+        if (r === 'admin') return 'Administrador';
+        if (r === 'ventas') return 'Comercial';
+        return 'Operador';
+    };
+
+    tbody.innerHTML = lista.map(u => `
+        <tr>
+            <td style="font-weight:500">${esc(u.nombre || '-')}</td>
+            <td>${esc(u.email || '-')}</td>
+            <td><span class="badge ${roleBadgeClass(u.rol)}">${roleLabel(u.rol)}</span></td>
+            <td><span class="badge ${u.activo === false ? 'b-gray' : 'b-ok'}">${u.activo === false ? 'Inactivo' : 'Activo'}</span></td>
+            <td style="color:var(--muted)">${fmtDate(u.created_at)}</td>
+            <td>
+                <div style="display:flex;gap:5px">
+                    <select class="inp btn-sm" style="padding:4px 8px;font-size:11px" onchange="window.cambiarRolUsuario('${u.id}', this.value)">
+                        <option value="admin" ${((u.rol || 'operador').toLowerCase() === 'admin') ? 'selected' : ''}>Administrador</option>
+                        <option value="ventas" ${((u.rol || 'operador').toLowerCase() === 'ventas') ? 'selected' : ''}>Comercial</option>
+                        <option value="operador" ${((u.rol || 'operador').toLowerCase() === 'operador') ? 'selected' : ''}>Operador</option>
+                    </select>
+                    <button class="btn btn-ghost btn-sm" onclick="window.toggleUsuarioActivo('${u.id}')">${u.activo === false ? 'Activar' : 'Desactivar'}</button>
+                </div>
+            </td>
+        </tr>
+    `).join('');
+}
+
+window.cambiarRolUsuario = async function(uid, nuevoRol) {
+    if ((currentPerfil?.rol || 'admin') !== 'admin') {
+        toast('Solo administradores pueden modificar roles', 'err');
+        return;
+    }
+
+    const rolesValidos = ['admin', 'ventas', 'operador'];
+    if (!rolesValidos.includes((nuevoRol || '').toLowerCase())) {
+        toast('Rol inválido', 'err');
+        return;
+    }
+
+    const u = usuarios.find(x => x.id === uid);
+    if (!u) return;
+    const rolActual = (u.rol || 'operador').toLowerCase();
+    const rolObjetivo = nuevoRol.toLowerCase();
+    if (rolActual === rolObjetivo) return;
+
+    const adminsActivos = usuarios.filter(x => (x.rol || 'operador').toLowerCase() === 'admin' && x.activo !== false).length;
+    const esAdminActivo = rolActual === 'admin' && u.activo !== false;
+    if (esAdminActivo && rolObjetivo !== 'admin' && adminsActivos <= 1) {
+        toast('No podés cambiar el rol del último administrador activo', 'wrn');
+        await cargarUsuarios();
+        return;
+    }
+
+    if (uid === currentUser?.uid && rolObjetivo !== 'admin') {
+        toast('No podés quitarte el rol administrador a vos mismo', 'wrn');
+        await cargarUsuarios();
+        return;
+    }
+
+    const label = rolObjetivo === 'admin' ? 'Administrador' : rolObjetivo === 'ventas' ? 'Comercial' : 'Operador';
+    if (!ask(`Confirma cambiar el rol a ${label}?`)) {
+        await cargarUsuarios();
+        return;
+    }
+
+    try {
+        await updateDoc(doc(db, 'usuarios', uid), {
+            rol: rolObjetivo,
+            updated_at: serverTimestamp(),
+        });
+        if (uid === currentUser?.uid) {
+            currentPerfil = { ...(currentPerfil || {}), rol: rolObjetivo };
+            sessionStorage.setItem('gp_user_role', rolObjetivo);
+        }
+        toast(`Rol actualizado a ${label}`);
+        await cargarUsuarios();
+    } catch (e) {
+        toast('No se pudo actualizar el rol: ' + e.message, 'err');
+        await cargarUsuarios();
+    }
+};
+
+window.toggleUsuarioActivo = async function(uid) {
+    if ((currentPerfil?.rol || 'admin') !== 'admin') {
+        toast('Solo administradores pueden modificar usuarios', 'err');
+        return;
+    }
+
+    const u = usuarios.find(x => x.id === uid);
+    if (!u) return;
+    if (uid === currentUser?.uid && u.activo !== false) {
+        toast('No podés desactivar tu propio usuario', 'wrn');
+        return;
+    }
+
+    const nuevoEstado = u.activo === false;
+
+    const rolActual = (u.rol || 'operador').toLowerCase();
+    const adminsActivos = usuarios.filter(x => (x.rol || 'operador').toLowerCase() === 'admin' && x.activo !== false).length;
+    if (!nuevoEstado && rolActual === 'admin' && adminsActivos <= 1) {
+        toast('No podés desactivar al último administrador activo', 'wrn');
+        return;
+    }
+
+    const txt = nuevoEstado ? 'activar' : 'desactivar';
+    if (!ask(`Confirma ${txt} este usuario?`)) return;
+
+    try {
+        await updateDoc(doc(db, 'usuarios', uid), {
+            activo: nuevoEstado,
+            updated_at: serverTimestamp(),
+        });
+        toast(`Usuario ${nuevoEstado ? 'activado' : 'desactivado'}`);
+        await cargarUsuarios();
+    } catch (e) {
+        toast('No se pudo actualizar el usuario: ' + e.message, 'err');
+    }
+};
+
+async function crearUsuario() {
+    if ((currentPerfil?.rol || 'admin') !== 'admin') {
+        toast('Solo administradores pueden crear usuarios', 'err');
+        return;
+    }
+
+    const nombre = (document.getElementById('f-nombre').value || '').trim();
+    const email = (document.getElementById('f-email').value || '').trim().toLowerCase();
+    const pass = document.getElementById('f-pass').value || '';
+    const rol = document.getElementById('f-rol').value || 'operador';
+
+    if (!nombre || !email || !pass) { toast('Completa nombre, email y contrasena', 'err'); return; }
+    if (pass.length < 6) { toast('La contrasena debe tener al menos 6 caracteres', 'err'); return; }
+    if (!/^\S+@\S+\.\S+$/.test(email)) { toast('Email invalido', 'err'); return; }
+
+    const btn = document.getElementById('btn-guardar');
+    btn.disabled = true;
+    const prevText = btn.textContent;
+    btn.textContent = 'Creando...';
+
+    let secondaryApp = null;
+    try {
+        const appName = `users-create-${Date.now()}`;
+        secondaryApp = initializeApp(firebaseConfig, appName);
+        const secondaryAuth = getAuth(secondaryApp);
+
+        const cred = await createUserWithEmailAndPassword(secondaryAuth, email, pass);
+
+        await setDoc(doc(db, 'usuarios', cred.user.uid), {
+            nombre,
+            email,
+            rol,
+            activo: true,
+            empresa_id: currentEmpresaId,
+            created_at: serverTimestamp(),
+            updated_at: serverTimestamp(),
+            creado_por: currentUser.uid,
+        }, { merge: true });
+
+        await secondaryAuth.signOut();
+
+        toast('Usuario creado correctamente');
+        closeModal('modal-usuario');
+        limpiarFormularioUsuario();
+        await cargarUsuarios();
+    } catch (e) {
+        const msgs = {
+            'auth/email-already-in-use': 'Ese email ya esta en uso',
+            'auth/invalid-email': 'Email invalido',
+            'auth/weak-password': 'Contrasena muy debil',
+            'auth/operation-not-allowed': 'Alta de usuario no habilitada en Firebase Authentication',
+        };
+        toast(msgs[e.code] || ('No se pudo crear el usuario: ' + e.message), 'err');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = prevText;
+        if (secondaryApp) {
+            try { await deleteApp(secondaryApp); } catch {}
+        }
+    }
+}
+
+function limpiarFormularioUsuario() {
+    document.getElementById('f-nombre').value = '';
+    document.getElementById('f-email').value = '';
+    document.getElementById('f-pass').value = '';
+    document.getElementById('f-pass').type = 'password';
+    document.getElementById('f-pass-toggle').textContent = 'Mostrar';
+    document.getElementById('f-pass-toggle').setAttribute('aria-label', 'Mostrar contraseña');
+    document.getElementById('f-rol').value = 'operador';
+}
+
+function openModal(id) {
+    const el = document.getElementById(id);
+    if (el) el.classList.add('open');
+}
+
+function closeModal(id) {
+    const el = document.getElementById(id);
+    if (el) el.classList.remove('open');
+}
+
+function fmtDate(v) {
+    if (!v) return '-';
+    if (v?.toDate) return v.toDate().toLocaleDateString('es-AR');
+    if (typeof v === 'string') {
+        const d = new Date(v);
+        if (!Number.isNaN(d.getTime())) return d.toLocaleDateString('es-AR');
+    }
+    return '-';
+}
+
+function esc(str='') {
+    return String(str)
+        .replaceAll('&','&amp;')
+        .replaceAll('<','&lt;')
+        .replaceAll('>','&gt;')
+        .replaceAll('"','&quot;')
+        .replaceAll("'",'&#39;');
+}
+</script>
+</body>
+</html>

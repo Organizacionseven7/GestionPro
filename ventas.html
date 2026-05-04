@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ventas / POS — GestiónPro</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="app"></div>
+<div id="toasts"></div>
+
+<script type="module">
+import { auth, db } from './js/firebase-config.js';
+import { onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { collection, doc, getDocs, addDoc, updateDoc, query, where, orderBy, serverTimestamp, writeBatch } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-lite.js";
+import { renderSidebar } from './js/sidebar.js';
+import { toast, openModal, closeModal, money, genId, ask } from './js/utils.js';
+import { ensureUserActive } from './js/access-control.js';
+import { ensureRoleAllowed } from './js/access-control.js';
+import { getEmpresaId } from './js/access-control.js';
+
+let ventas = [], clientes = [], productos = [], carrito = [];
+let currentEmpresaId = null;
+
+onAuthStateChanged(auth, async user => {
+    if (!user) { window.location.href='login.html'; return; }
+    if (!(await ensureUserActive(auth, db, user))) return;
+    if (!(await ensureRoleAllowed(db, user, ['admin', 'ventas']))) return;
+    currentEmpresaId = getEmpresaId() || user.uid;
+    renderApp();
+    document.getElementById('btn-logout').addEventListener('click', ()=>signOut(auth).then(()=>location.href='login.html'));
+    document.getElementById('user-name').textContent = user.email;
+    document.getElementById('user-avatar').textContent = user.email[0].toUpperCase();
+    await Promise.all([cargarClientes(), cargarProductos()]);
+    await cargarVentas();
+});
+
+function renderApp() {
+    document.getElementById('app').innerHTML = `
+        ${renderSidebar('ventas')}
+        <main class="main">
+            <header class="topbar">
+                <div style="display:flex;align-items:center;gap:10px">
+                    <button class="btn btn-ghost btn-sm btn-menu">☰</button>
+                    <span class="topbar-title">Ventas / POS</span>
+                </div>
+                <button class="btn btn-primary" id="btn-nueva">+ Nueva venta</button>
+            </header>
+
+            <div class="page">
+                <div class="stats-grid">
+                    <div class="stat-card c-accent"><div class="slabel">Ventas hoy</div><div class="sval" id="s-hoy">$0,00</div></div>
+                    <div class="stat-card c-ok"><div class="slabel">Ventas del mes</div><div class="sval" id="s-mes">$0,00</div></div>
+                    <div class="stat-card c-warn"><div class="slabel">Tickets</div><div class="sval" id="s-cant">0</div></div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Últimas ventas</h2>
+                        <input class="inp inp-search" id="busca" placeholder="Buscar por número o cliente…" oninput="window.filtrarVentas()">
+                    </div>
+                    <div class="table-wrap">
+                        <table>
+                            <thead><tr><th>Número</th><th>Cliente</th><th>Canal</th><th>Método</th><th>Fecha</th><th>Total</th><th>Acciones</th></tr></thead>
+                            <tbody id="tbody"></tbody>
+                        </table>
+                    </div>
+                    <div class="pag"><span id="pag-info">—</span></div>
+                </div>
+            </div>
+        </main>
+
+        <div class="overlay" id="modal-venta">
+            <div class="modal" style="max-width:1080px">
+                <div class="modal-head">
+                    <h3>Nueva venta</h3>
+                    <button class="btn btn-ghost btn-sm" onclick="closeModal('modal-venta')">✕</button>
+                </div>
+                <div class="modal-body" style="display:grid;grid-template-columns:1.2fr .8fr;gap:16px">
+                    <div>
+                        <div class="form-grid" style="margin-bottom:12px">
+                            <div class="fgroup"><label>Número</label><input class="inp" id="f-num" readonly></div>
+                            <div class="fgroup"><label>Cliente</label><select class="inp" id="f-cli"><option value="">Consumidor final</option></select></div>
+                            <div class="fgroup"><label>Método de pago</label>
+                                <select class="inp" id="f-metodo">
+                                    <option value="efectivo">Efectivo</option>
+                                    <option value="tarjeta">Tarjeta</option>
+                                    <option value="transferencia">Transferencia</option>
+                                    <option value="billetera">Billetera virtual</option>
+                                </select>
+                            </div>
+                            <div class="fgroup"><label>Canal</label>
+                                <select class="inp" id="f-canal">
+                                    <option value="local">Local</option>
+                                    <option value="online">Online</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="card" style="margin-bottom:10px">
+                            <div class="card-header" style="padding:10px 12px">
+                                <h2>Productos</h2>
+                                <input class="inp inp-search" id="busca-prod" placeholder="Buscar producto…" oninput="window.filtrarProductosPOS()">
+                            </div>
+                            <div id="grid-prod" style="padding:12px;display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px;max-height:360px;overflow:auto"></div>
+                        </div>
+                    </div>
+
+                    <div>
+                        <div class="card" style="height:100%;display:flex;flex-direction:column">
+                            <div class="card-header" style="padding:10px 12px"><h2>Carrito</h2></div>
+                            <div id="carrito" style="padding:12px;flex:1;overflow:auto"></div>
+                            <div class="totals-box" style="margin:12px">
+                                <div class="trow"><span>Subtotal</span><span id="t-sub">$0,00</span></div>
+                                <div class="trow">
+                                    <span style="display:flex;align-items:center;gap:6px">Descuento
+                                        <input class="inp" id="t-desc" type="number" min="0" step="0.01" value="0" style="width:90px;padding:4px 8px" oninput="calcTotales()">
+                                    </span>
+                                    <span id="t-descv">-$0,00</span>
+                                </div>
+                                <div class="trow big"><span>TOTAL</span><span id="t-total">$0,00</span></div>
+                            </div>
+                            <div class="modal-foot" style="border-top:1px solid var(--border)">
+                                <button class="btn btn-ghost" onclick="closeModal('modal-venta')">Cancelar</button>
+                                <button class="btn btn-primary" id="btn-cobrar">Cobrar</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>`;
+
+    document.getElementById('btn-nueva').addEventListener('click', abrirPOS);
+    document.getElementById('btn-cobrar').addEventListener('click', cobrarVenta);
+    document.querySelector('.btn-menu').addEventListener('click', ()=>document.querySelector('.sidebar').classList.toggle('open'));
+}
+
+async function cargarClientes() {
+    const snap = await getDocs(query(collection(db,'clientes'), where('empresa_id','==',currentEmpresaId), where('activo','==',true)));
+    clientes = snap.docs
+        .map(d=>({id:d.id,...d.data()}))
+        .sort((a,b) => (a.nombre||'').localeCompare((b.nombre||''), 'es', { sensitivity:'base' }));
+    const sel = document.getElementById('f-cli');
+    clientes.forEach(c => sel.innerHTML += `<option value="${c.id}">${c.nombre}</option>`);
+}
+
+async function cargarProductos() {
+    const snap = await getDocs(query(collection(db,'productos'), where('empresa_id','==',currentEmpresaId), where('activo','==',true)));
+    productos = snap.docs
+        .map(d=>({id:d.id,...d.data()}))
+        .sort((a,b) => (a.nombre||'').localeCompare((b.nombre||''), 'es', { sensitivity:'base' }));
+}
+
+async function cargarVentas() {
+    const snap = await getDocs(query(collection(db,'ventas'), where('empresa_id','==',currentEmpresaId), orderBy('created_at','desc')));
+    ventas = snap.docs.map(d=>({id:d.id,...d.data()})).filter(v=>v.estado!=='anulada');
+    actualizarStats();
+    filtrarVentas();
+}
+
+function actualizarStats() {
+    const hoyStr = new Date().toISOString().split('T')[0];
+    const iniMes = new Date(); iniMes.setDate(1); iniMes.setHours(0,0,0,0);
+    const ventasHoy = ventas.filter(v => v.fecha === hoyStr);
+    const ventasMes = ventas.filter(v => {
+        if (v.created_at?.toDate) return v.created_at.toDate() >= iniMes;
+        if (v.fecha) return new Date(v.fecha + 'T00:00:00') >= iniMes;
+        return false;
+    });
+    document.getElementById('s-hoy').textContent = money(ventasHoy.reduce((a,v)=>a+(v.total||0),0));
+    document.getElementById('s-mes').textContent = money(ventasMes.reduce((a,v)=>a+(v.total||0),0));
+    document.getElementById('s-cant').textContent = ventas.length;
+}
+
+window.filtrarVentas = function() {
+    const q = document.getElementById('busca').value.toLowerCase();
+    const lista = ventas.filter(v => !q || v.numero?.toLowerCase().includes(q) || v.cliente_nombre?.toLowerCase().includes(q));
+    document.getElementById('pag-info').textContent = `${lista.length} venta${lista.length!==1?'s':''}`;
+    const tbody = document.getElementById('tbody');
+    if (!lista.length) {
+        tbody.innerHTML = `<tr><td colspan="7"><div class="empty"><div class="eicon">◎</div><p>No hay ventas</p></div></td></tr>`;
+        return;
+    }
+    tbody.innerHTML = lista.map(v => `<tr>
+        <td><span class="chip">${v.numero||v.id.slice(0,8)}</span></td>
+        <td>${v.cliente_nombre||'<span style="color:var(--muted)">Consumidor final</span>'}</td>
+        <td><span class="badge b-info">${v.canal||'local'}</span></td>
+        <td>${v.metodo_pago||'—'}</td>
+        <td style="color:var(--muted)">${v.fecha||'—'}</td>
+        <td style="font-family:'DM Mono',monospace;font-weight:600">${money(v.total)}</td>
+        <td><button class="btn btn-danger btn-sm" onclick="window.anularVenta('${v.id}')">✕</button></td>
+    </tr>`).join('');
+};
+
+function abrirPOS() {
+    carrito = [];
+    document.getElementById('f-num').value = genId('VEN');
+    document.getElementById('f-cli').value = '';
+    document.getElementById('f-metodo').value = 'efectivo';
+    document.getElementById('f-canal').value = 'local';
+    document.getElementById('t-desc').value = '0';
+    document.getElementById('busca-prod').value = '';
+    filtrarProductosPOS();
+    renderCarrito();
+    openModal('modal-venta');
+}
+
+window.filtrarProductosPOS = function() {
+    const q = document.getElementById('busca-prod').value.toLowerCase();
+    const lista = productos.filter(p => !q || p.nombre?.toLowerCase().includes(q) || p.codigo?.toLowerCase().includes(q));
+    const grid = document.getElementById('grid-prod');
+    if (!lista.length) {
+        grid.innerHTML = `<div class="empty" style="grid-column:1/-1;padding:20px"><p>Sin resultados</p></div>`;
+        return;
+    }
+    grid.innerHTML = lista.map(p => {
+        const stock = p.stock_actual||0;
+        const sinStock = stock <= 0;
+        return `<div class="card" style="padding:10px;display:flex;flex-direction:column;gap:6px">
+            <div style="font-weight:600;font-size:13px;line-height:1.2">${p.nombre}</div>
+            <div style="font-size:11px;color:var(--muted)">${p.codigo||'Sin código'}</div>
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+                <span style="font-family:'DM Mono',monospace;font-weight:700">${money(p.precio_venta)}</span>
+                <span class="badge ${stock<=p.stock_minimo?'b-warn':'b-ok'}">Stock ${stock}</span>
+            </div>
+            <button class="btn ${sinStock?'btn-ghost':'btn-primary'} btn-sm" ${sinStock?'disabled':''} onclick="window.agregarAlCarrito('${p.id}')">${sinStock?'Sin stock':'+ Agregar'}</button>
+        </div>`;
+    }).join('');
+};
+
+window.agregarAlCarrito = function(prodId) {
+    const producto = productos.find(p=>p.id===prodId);
+    if (!producto) return;
+    if ((producto.stock_actual||0) <= 0) { toast('Producto sin stock','err'); return; }
+    const existente = carrito.find(i=>i.prod_id===prodId);
+    if (existente) {
+        if (existente.cantidad >= (producto.stock_actual||0)) { toast('No hay más stock disponible','wrn'); return; }
+        existente.cantidad += 1;
+    } else {
+        carrito.push({ prod_id:producto.id, nombre:producto.nombre, precio:producto.precio_venta||0, cantidad:1, max:producto.stock_actual||0 });
+    }
+    renderCarrito();
+};
+
+window.modCant = function(index, delta) {
+    const it = carrito[index];
+    if (!it) return;
+    it.cantidad = Math.max(1, Math.min(it.max, it.cantidad + delta));
+    renderCarrito();
+};
+
+window.quitarItem = function(index) {
+    carrito.splice(index,1);
+    renderCarrito();
+};
+
+function renderCarrito() {
+    const cont = document.getElementById('carrito');
+    if (!carrito.length) {
+        cont.innerHTML = `<div class="empty" style="padding:20px"><div class="eicon">🛒</div><p>Carrito vacío</p></div>`;
+        calcTotales();
+        return;
+    }
+    cont.innerHTML = carrito.map((it,i)=>`<div style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:8px;background:var(--bg3)">
+        <div style="display:flex;justify-content:space-between;gap:10px">
+            <div style="font-weight:600;font-size:13px">${it.nombre}</div>
+            <button class="btn btn-danger btn-sm" style="padding:3px 8px" onclick="window.quitarItem(${i})">✕</button>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px">
+            <div style="display:flex;align-items:center;gap:6px">
+                <button class="btn btn-ghost btn-sm" style="padding:2px 8px" onclick="window.modCant(${i},-1)">−</button>
+                <span class="chip">${it.cantidad}</span>
+                <button class="btn btn-ghost btn-sm" style="padding:2px 8px" onclick="window.modCant(${i},1)">+</button>
+            </div>
+            <div style="font-family:'DM Mono',monospace;font-weight:700">${money(it.precio * it.cantidad)}</div>
+        </div>
+    </div>`).join('');
+    calcTotales();
+}
+
+window.calcTotales = calcTotales;
+function calcTotales() {
+    const sub = carrito.reduce((a,it)=>a+(it.precio*it.cantidad),0);
+    const desc = parseFloat(document.getElementById('t-desc')?.value)||0;
+    const total = Math.max(0, sub-desc);
+    document.getElementById('t-sub').textContent = money(sub);
+    document.getElementById('t-descv').textContent = '-' + money(desc);
+    document.getElementById('t-total').textContent = money(total);
+}
+
+async function cobrarVenta() {
+    if (!carrito.length) { toast('Agregá productos al carrito','err'); return; }
+    if (!ask('¿Confirmar cobro de esta venta?')) return;
+
+    const btn = document.getElementById('btn-cobrar');
+    btn.disabled = true;
+    btn.textContent = 'Cobrando…';
+
+    const cliId = document.getElementById('f-cli').value;
+    const cli = clientes.find(c=>c.id===cliId);
+    const sub = carrito.reduce((a,it)=>a+(it.precio*it.cantidad),0);
+    const desc = parseFloat(document.getElementById('t-desc').value)||0;
+    const total = Math.max(0, sub-desc);
+
+    const data = {
+        empresa_id: currentEmpresaId,
+        numero: document.getElementById('f-num').value,
+        cliente_id: cliId || null,
+        cliente_nombre: cli?.nombre || null,
+        metodo_pago: document.getElementById('f-metodo').value,
+        canal: document.getElementById('f-canal').value,
+        fecha: new Date().toISOString().split('T')[0],
+        subtotal: sub,
+        descuento: desc,
+        total,
+        items: carrito.map(it=>({ prod_id:it.prod_id, nombre:it.nombre, precio:it.precio, cantidad:it.cantidad, subtotal:it.precio*it.cantidad })),
+        estado: 'confirmada',
+        created_at: serverTimestamp(),
+    };
+
+    try {
+        const ventaRef = await addDoc(collection(db,'ventas'), data);
+
+        const batch = writeBatch(db);
+        for (const it of carrito) {
+            const prod = productos.find(p=>p.id===it.prod_id);
+            if (!prod) continue;
+            const nuevoStock = Math.max(0, (prod.stock_actual||0) - it.cantidad);
+            batch.update(doc(db,'productos',it.prod_id), { stock_actual: nuevoStock, updated_at: serverTimestamp() });
+            batch.set(doc(collection(db,'movimientos_stock')), {
+                empresa_id: currentEmpresaId,
+                producto_id: it.prod_id,
+                tipo: 'SALIDA',
+                cantidad: it.cantidad,
+                ref_tipo: 'venta',
+                ref_id: ventaRef.id,
+                fecha: data.fecha,
+                created_at: serverTimestamp()
+            });
+        }
+        await batch.commit();
+
+        toast('Venta cobrada correctamente');
+        imprimirTicket({
+            numero: data.numero,
+            cliente: data.cliente_nombre || 'Consumidor final',
+            metodo: data.metodo_pago,
+            canal: data.canal,
+            fecha: data.fecha,
+            items: data.items,
+            subtotal: data.subtotal,
+            descuento: data.descuento,
+            total: data.total,
+        });
+
+        closeModal('modal-venta');
+        await Promise.all([cargarProductos(), cargarVentas()]);
+    } catch (e) {
+        toast('Error al cobrar: ' + e.message, 'err');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Cobrar';
+    }
+}
+
+function imprimirTicket(ticket) {
+    const lineas = ticket.items.map(it => `<tr><td>${it.nombre}</td><td style="text-align:center">${it.cantidad}</td><td style="text-align:right">${money(it.subtotal)}</td></tr>`).join('');
+    const w = window.open('', '_blank', 'width=420,height=700');
+    if (!w) { toast('No se pudo abrir la ventana de impresión', 'wrn'); return; }
+    w.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Ticket ${ticket.numero}</title>
+        <style>
+            body{font-family:Arial,sans-serif;padding:16px;color:#111}
+            @page { margin: 12mm 10mm; }
+            .wm{position:fixed;inset:0;background:url('assets/logo-watermark.png') center 52%/82% auto no-repeat;opacity:.18;filter:saturate(118%) contrast(108%);pointer-events:none;z-index:0}
+            .sheet{position:relative;z-index:1}
+            h2{margin:0 0 6px 0;font-size:18px}
+            .mut{font-size:12px;color:#444;margin:2px 0}
+            table{width:100%;border-collapse:collapse;margin-top:12px}
+            th,td{font-size:12px;padding:6px 0;border-bottom:1px solid #ddd}
+            .tot{margin-top:10px;font-size:13px}
+            .tot div{display:flex;justify-content:space-between;padding:2px 0}
+            .big{font-weight:700;font-size:16px;border-top:1px solid #111;padding-top:6px;margin-top:6px}
+            @media print { .wm{opacity:.2;-webkit-print-color-adjust:exact;print-color-adjust:exact;} }
+        </style></head><body>
+        <div class="wm"></div>
+        <div class="sheet">
+        <h2>GestiónPro</h2>
+        <div class="mut">Ticket: ${ticket.numero}</div>
+        <div class="mut">Fecha: ${ticket.fecha}</div>
+        <div class="mut">Cliente: ${ticket.cliente}</div>
+        <div class="mut">Método: ${ticket.metodo} | Canal: ${ticket.canal}</div>
+        <table><thead><tr><th style="text-align:left">Producto</th><th style="text-align:center">Cant.</th><th style="text-align:right">Subtotal</th></tr></thead><tbody>${lineas}</tbody></table>
+        <div class="tot">
+            <div><span>Subtotal</span><span>${money(ticket.subtotal)}</span></div>
+            <div><span>Descuento</span><span>-${money(ticket.descuento)}</span></div>
+            <div class="big"><span>Total</span><span>${money(ticket.total)}</span></div>
+        </div>
+        <p class="mut" style="margin-top:14px">¡Gracias por tu compra!</p>
+        </div>
+        <script>window.onload=()=>window.print();<\/script>
+        </body></html>`);
+    w.document.close();
+}
+
+window.anularVenta = async function(id) {
+    if (!ask('¿Anular esta venta?')) return;
+    await updateDoc(doc(db,'ventas',id), {estado:'anulada'});
+    toast('Venta anulada','wrn');
+    await cargarVentas();
+};
+</script>
+</body>
+</html>

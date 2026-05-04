@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Diagnóstico Firebase — GestiónPro</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body style="display:block;min-height:100vh;padding:24px">
+    <div class="card" style="max-width:760px;margin:0 auto">
+        <div class="card-header">
+            <h2>Diagnóstico de guardado (Firestore)</h2>
+            <a href="index.html" class="btn btn-ghost btn-sm">Volver</a>
+        </div>
+        <div class="modal-body">
+            <p style="color:var(--muted);margin-bottom:14px">Este test intenta guardar un documento de prueba y leerlo inmediatamente. Te dirá la causa exacta si falla.</p>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
+                <button class="btn btn-primary" id="btn-test">Ejecutar diagnóstico</button>
+                <button class="btn btn-ghost" id="btn-clean">Limpiar</button>
+            </div>
+            <div class="card" style="padding:12px;background:var(--bg3)">
+                <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">Resultado</div>
+                <pre id="out" style="white-space:pre-wrap;word-break:break-word;font-family:'DM Mono',monospace;font-size:12px;line-height:1.45">Listo para ejecutar…</pre>
+            </div>
+        </div>
+    </div>
+
+<script type="module">
+import { auth, db } from './js/firebase-config.js';
+import { onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { collection, addDoc, getDoc, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-lite.js";
+import { ensureUserActive } from './js/access-control.js';
+import { ensureRoleAllowed } from './js/access-control.js';
+import { getEmpresaId } from './js/access-control.js';
+
+const out = document.getElementById('out');
+const btn = document.getElementById('btn-test');
+const btnClean = document.getElementById('btn-clean');
+
+let currentUser = null;
+let currentEmpresaId = null;
+
+function parseJwtPayload(token) {
+    try {
+        const part = token.split('.')[1];
+        const json = atob(part.replace(/-/g, '+').replace(/_/g, '/'));
+        return JSON.parse(json);
+    } catch {
+        return null;
+    }
+}
+
+function withTimeout(promise, ms, step) {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`timeout:${step}:${ms}`)), ms))
+    ]);
+}
+
+onAuthStateChanged(auth, async user => {
+    currentUser = user;
+    if (!user) {
+        out.textContent = 'No hay sesión activa. Iniciá sesión en login.html y volvé a esta pantalla.';
+        return;
+    }
+    if (!(await ensureUserActive(auth, db, user))) {
+        currentUser = null;
+        return;
+    }
+    if (!(await ensureRoleAllowed(db, user, ['admin']))) {
+        currentUser = null;
+        return;
+    }
+    currentEmpresaId = getEmpresaId() || user.uid;
+    out.textContent = `Sesión activa: ${user.email}\nProyecto config: ${auth.app.options.projectId}\nPresioná "Ejecutar diagnóstico".`;
+});
+
+btn.addEventListener('click', async () => {
+    if (!currentUser) {
+        out.textContent = 'No hay sesión activa. Iniciá sesión primero.';
+        return;
+    }
+
+    btn.disabled = true;
+    out.textContent = 'Probando escritura…';
+
+    try {
+        const token = await currentUser.getIdToken();
+        const jwt = parseJwtPayload(token);
+        const payload = {
+            from: 'diagnostico.html',
+            empresa_id: currentEmpresaId,
+            uid: currentUser.uid,
+            email: currentUser.email || null,
+            created_at: serverTimestamp(),
+            client_time: new Date().toISOString()
+        };
+
+        const resultados = [];
+        for (const col of ['__diagnostico_guardado', 'clientes']) {
+            try {
+                const ref = await withTimeout(addDoc(collection(db, col), payload), 12000, `write:${col}`);
+                const snap = await withTimeout(getDoc(ref), 12000, `read:${col}`);
+                resultados.push(`✅ ${col}: write/read OK (${ref.id}) ${snap.exists() ? '' : '(sin lectura)'}`);
+            } catch (err) {
+                resultados.push(`❌ ${col}: ${err?.code || 'sin-codigo'} | ${err?.message || 'sin mensaje'}`);
+            }
+        }
+
+        out.textContent = [
+            'Resultado de pruebas por colección:',
+            ...resultados,
+            '',
+            `Usuario: ${currentUser.email}`,
+            `UID: ${currentUser.uid}`,
+            `Proyecto config: ${auth.app.options.projectId}`,
+            `JWT aud: ${jwt?.aud || 'n/d'}`,
+            `JWT iss: ${jwt?.iss || 'n/d'}`
+        ].join('\n');
+    } catch (e) {
+        const code = e?.code || 'sin-codigo';
+        const msg = e?.message || 'sin detalle';
+        const isTimeout = String(msg).startsWith('timeout:');
+        const tips = {
+            'permission-denied': 'Revisá reglas de Firestore (request.auth != null) y que estés logueado con el mismo proyecto.',
+            'unauthenticated': 'Tu sesión no está autenticada para Firestore. Cerrá sesión y volvé a entrar.',
+            'unavailable': 'No hay conexión con Firestore o la API está bloqueada por red/firewall.',
+            'failed-precondition': 'Puede faltar habilitar Firestore o hay configuración pendiente del proyecto.',
+            'not-found': 'La base de datos Firestore del proyecto no existe o no está creada.',
+        };
+
+                const apiDisabled = /firestore\.googleapis\.com|has not been used|disabled/i.test(msg);
+                out.textContent = isTimeout
+                        ? [
+                                '❌ DIAGNÓSTICO FALLÓ POR TIMEOUT',
+                                `Detalle: ${msg}`,
+                                'Sugerencia: la red/antivirus/firewall está frenando la conexión a Firestore.',
+                                'Probá desactivar VPN/proxy, permitir el navegador en firewall o cambiar de red.',
+                                'Luego ejecutá el test otra vez.'
+                            ].join('\n')
+                        : apiDisabled
+                                ? [
+                                        '❌ DIAGNÓSTICO FALLÓ',
+                                        `Código: ${code}`,
+                                        `Mensaje: ${msg}`,
+                                        'Sugerencia: habilitá la API de Firestore en Google Cloud para este proyecto y esperá 2-5 minutos.'
+                                    ].join('\n')
+                                : [
+                                        '❌ DIAGNÓSTICO FALLÓ',
+                                        `Código: ${code}`,
+                                        `Mensaje: ${msg}`,
+                                        `Sugerencia: ${tips[code] || 'Copiá este resultado y te lo corrijo exacto.'}`
+                                    ].join('\n');
+        console.error('Diagnóstico Firestore', e);
+    } finally {
+        btn.disabled = false;
+    }
+});
+
+btnClean.addEventListener('click', () => {
+    out.textContent = currentUser ? `Sesión activa: ${currentUser.email}\nPresioná "Ejecutar diagnóstico".` : 'No hay sesión activa.';
+});
+</script>
+</body>
+</html>

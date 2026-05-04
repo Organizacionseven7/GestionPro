@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Clientes — GestiónPro</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="app"></div>
+<div id="toasts"></div>
+
+<script type="module">
+import { auth, db } from './js/firebase-config.js';
+import { onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { collection, doc, getDocs, addDoc, updateDoc, query, where, orderBy, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-lite.js";
+import { renderSidebar } from './js/sidebar.js';
+import { toast, openModal, closeModal, ask, money } from './js/utils.js';
+import { ensureUserActive } from './js/access-control.js';
+import { ensureRoleAllowed } from './js/access-control.js';
+import { getEmpresaId } from './js/access-control.js';
+
+let clientes = [], editId = null;
+let currentEmpresaId = null;
+
+onAuthStateChanged(auth, async user => {
+    if (!user) { window.location.href = 'login.html'; return; }
+    if (!(await ensureUserActive(auth, db, user))) return;
+    if (!(await ensureRoleAllowed(db, user, ['admin', 'ventas']))) return;
+    currentEmpresaId = getEmpresaId() || user.uid;
+    renderApp();
+    document.getElementById('btn-logout').addEventListener('click', () => signOut(auth).then(() => location.href='login.html'));
+    document.getElementById('user-name').textContent = user.email;
+    document.getElementById('user-avatar').textContent = user.email[0].toUpperCase();
+    await cargar();
+});
+
+function renderApp() {
+    document.getElementById('app').innerHTML = `
+        ${renderSidebar('clientes')}
+        <main class="main">
+            <header class="topbar">
+                <div style="display:flex;align-items:center;gap:10px">
+                    <button class="btn btn-ghost btn-sm btn-menu">☰</button>
+                    <span class="topbar-title">Clientes</span>
+                </div>
+                <button class="btn btn-primary" id="btn-nuevo">+ Nuevo cliente</button>
+            </header>
+            <div class="page">
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Listado de clientes</h2>
+                        <div style="display:flex;gap:8px">
+                            <input class="inp inp-search" id="busca" placeholder="Buscar…" oninput="window.filtrar()">
+                            <select class="inp" id="ftipo" onchange="window.filtrar()" style="width:auto">
+                                <option value="">Todos</option>
+                                <option value="particular">Particular</option>
+                                <option value="empresa">Empresa</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="table-wrap">
+                        <table>
+                            <thead><tr><th>Nombre</th><th>Tipo</th><th>DNI / CUIT</th><th>Email</th><th>Teléfono</th><th>Acciones</th></tr></thead>
+                            <tbody id="tbody"></tbody>
+                        </table>
+                    </div>
+                    <div class="pag"><span id="pag-info">—</span></div>
+                </div>
+            </div>
+        </main>
+
+        <div class="overlay" id="modal-cli">
+            <div class="modal">
+                <div class="modal-head">
+                    <h3 id="modal-title">Nuevo cliente</h3>
+                    <button class="btn btn-ghost btn-sm" onclick="closeModal('modal-cli')">✕</button>
+                </div>
+                <div class="modal-body">
+                    <div class="form-grid">
+                        <div class="fgroup full"><label>Nombre / Razón social *</label><input class="inp" id="f-nombre" required placeholder="Ej: Juan Pérez"></div>
+                        <div class="fgroup"><label>Tipo</label>
+                            <select class="inp" id="f-tipo">
+                                <option value="particular">Particular</option>
+                                <option value="empresa">Empresa</option>
+                            </select>
+                        </div>
+                        <div class="fgroup"><label>DNI / CUIT</label><input class="inp" id="f-dni" placeholder="20-12345678-9"></div>
+                        <div class="fgroup"><label>Email</label><input class="inp" type="email" id="f-email" placeholder="cliente@email.com"></div>
+                        <div class="fgroup"><label>Teléfono</label><input class="inp" id="f-tel" placeholder="+54 9 2302 000000"></div>
+                        <div class="fgroup full"><label>Dirección</label><input class="inp" id="f-dir" placeholder="Calle 123, Ciudad"></div>
+                        <div class="fgroup full"><label>Notas</label><textarea class="inp" id="f-notas" placeholder="Notas internas…"></textarea></div>
+                    </div>
+                </div>
+                <div class="modal-foot">
+                    <button class="btn btn-ghost" onclick="closeModal('modal-cli')">Cancelar</button>
+                    <button class="btn btn-primary" id="btn-guardar">Guardar</button>
+                </div>
+            </div>
+        </div>`;
+
+    document.getElementById('app').innerHTML += `
+        <div class="overlay" id="modal-estado-cuenta">
+            <div class="modal" style="max-width:980px">
+                <div class="modal-head">
+                    <h3 id="ec-title">Estado de cuenta</h3>
+                    <button class="btn btn-ghost btn-sm" onclick="closeModal('modal-estado-cuenta')">✕</button>
+                </div>
+                <div class="modal-body">
+                    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:14px">
+                        <div class="card" style="padding:10px"><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700">Facturado</div><div id="ec-facturado" style="font-family:'DM Mono',monospace;font-weight:700">—</div></div>
+                        <div class="card" style="padding:10px"><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700">Cobrado</div><div id="ec-cobrado" style="font-family:'DM Mono',monospace;font-weight:700;color:var(--success)">—</div></div>
+                        <div class="card" style="padding:10px"><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700">Saldo pendiente</div><div id="ec-saldo" style="font-family:'DM Mono',monospace;font-weight:700;color:var(--warning)">—</div></div>
+                        <div class="card" style="padding:10px"><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700">Vencido</div><div id="ec-vencido" style="font-family:'DM Mono',monospace;font-weight:700;color:var(--danger)">—</div></div>
+                    </div>
+
+                    <div class="card" style="margin-bottom:12px">
+                        <div class="card-header"><h2>Facturas del cliente</h2></div>
+                        <div class="table-wrap">
+                            <table>
+                                <thead><tr><th>Número</th><th>Emisión</th><th>Vencimiento</th><th>Total</th><th>Estado</th><th>Pago</th></tr></thead>
+                                <tbody id="ec-tbody-facturas"></tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header"><h2>Pagos / movimientos vinculados</h2></div>
+                        <div class="table-wrap">
+                            <table>
+                                <thead><tr><th>Fecha</th><th>Tipo</th><th>Concepto</th><th>Método</th><th>Monto</th></tr></thead>
+                                <tbody id="ec-tbody-pagos"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-foot">
+                    <button class="btn btn-ghost" onclick="closeModal('modal-estado-cuenta')">Cerrar</button>
+                </div>
+            </div>
+        </div>`;
+
+    document.getElementById('btn-nuevo').addEventListener('click', abrirNuevo);
+    document.getElementById('btn-guardar').addEventListener('click', guardar);
+    document.querySelector('.btn-menu').addEventListener('click', () => document.querySelector('.sidebar').classList.toggle('open'));
+}
+
+async function cargar() {
+    const snap = await getDocs(query(collection(db,'clientes'), where('empresa_id','==',currentEmpresaId), where('activo','==',true)));
+    clientes = snap.docs
+        .map(d => ({id:d.id,...d.data()}))
+        .sort((a,b) => (a.nombre||'').localeCompare((b.nombre||''), 'es', { sensitivity:'base' }));
+    filtrar();
+}
+
+window.filtrar = function() {
+    const busca = document.getElementById('busca').value.toLowerCase();
+    const tipo  = document.getElementById('ftipo').value;
+    const lista = clientes.filter(c => {
+        const ok1 = !busca || c.nombre?.toLowerCase().includes(busca) || c.email?.toLowerCase().includes(busca) || c.dni?.includes(busca);
+        const ok2 = !tipo || c.tipo === tipo;
+        return ok1 && ok2;
+    });
+    document.getElementById('pag-info').textContent = `${lista.length} cliente${lista.length!==1?'s':''}`;
+    const tbody = document.getElementById('tbody');
+    if (!lista.length) {
+        tbody.innerHTML = `<tr><td colspan="6"><div class="empty"><div class="eicon">◉</div><p>No se encontraron clientes</p></div></td></tr>`;
+        return;
+    }
+    tbody.innerHTML = lista.map(c => `<tr>
+        <td style="font-weight:500">${c.nombre}</td>
+        <td><span class="badge ${c.tipo==='empresa'?'b-info':'b-gray'}">${c.tipo}</span></td>
+        <td><span class="chip">${c.dni||'—'}</span></td>
+        <td>${c.email||'<span style="color:var(--muted)">—</span>'}</td>
+        <td>${c.telefono||'<span style="color:var(--muted)">—</span>'}</td>
+        <td><div style="display:flex;gap:5px">
+            <button class="btn btn-ghost btn-sm" onclick="window.verEstadoCuenta('${c.id}')">Estado</button>
+            <button class="btn btn-ghost btn-sm" onclick="window.editar('${c.id}')">✎</button>
+            <button class="btn btn-danger btn-sm" onclick="window.eliminar('${c.id}','${c.nombre.replace(/'/g,"\\'")}')">✕</button>
+        </div></td>
+    </tr>`).join('');
+};
+
+function estadoFacturaLabel(f) {
+    const fvenc = f.fecha_vencimiento ? new Date(f.fecha_vencimiento) : null;
+    const hoy = new Date();
+    if (f.estado === 'pendiente' && fvenc && fvenc < hoy) return 'vencida';
+    return f.estado || 'pendiente';
+}
+
+window.verEstadoCuenta = async function(id) {
+    const cli = clientes.find(x=>x.id===id);
+    if (!cli) return;
+
+    document.getElementById('ec-title').textContent = `Estado de cuenta — ${cli.nombre}`;
+    document.getElementById('ec-facturado').textContent = 'Cargando…';
+    document.getElementById('ec-cobrado').textContent = 'Cargando…';
+    document.getElementById('ec-saldo').textContent = 'Cargando…';
+    document.getElementById('ec-vencido').textContent = 'Cargando…';
+    document.getElementById('ec-tbody-facturas').innerHTML = `<tr><td colspan="6" style="color:var(--muted)">Cargando…</td></tr>`;
+    document.getElementById('ec-tbody-pagos').innerHTML = `<tr><td colspan="5" style="color:var(--muted)">Cargando…</td></tr>`;
+    openModal('modal-estado-cuenta');
+
+    try {
+        const [snapFacturas, snapPagos] = await Promise.all([
+            getDocs(query(collection(db,'facturas'), where('empresa_id','==',currentEmpresaId), where('cliente_id','==',id))),
+            getDocs(query(collection(db,'pagos'), where('empresa_id','==',currentEmpresaId), where('cliente_id','==',id))),
+        ]);
+
+        const facturas = snapFacturas.docs.map(d => ({ id:d.id, ...d.data() }));
+        const pagos = snapPagos.docs.map(d => ({ id:d.id, ...d.data() })).filter(p => !p.anulado);
+
+        const facturasActivas = facturas.filter(f => f.estado !== 'anulada');
+        const totalFacturado = facturasActivas.reduce((a,f) => a + (parseFloat(f.total)||0), 0);
+        const totalCobradoFacturas = facturasActivas
+            .filter(f => f.estado === 'pagada')
+            .reduce((a,f) => a + (parseFloat(f.total)||0), 0);
+        const totalCobradoPagos = pagos
+            .filter(p => p.tipo === 'ingreso')
+            .reduce((a,p) => a + (parseFloat(p.monto)||0), 0);
+
+        // Preferimos el cobro real de facturas; si no hay, usamos ingresos manuales vinculados.
+        const totalCobrado = totalCobradoFacturas > 0 ? totalCobradoFacturas : totalCobradoPagos;
+
+        const vencido = facturasActivas
+            .filter(f => estadoFacturaLabel(f) === 'vencida')
+            .reduce((a,f) => a + (parseFloat(f.total)||0), 0);
+        const saldo = Math.max(0, totalFacturado - totalCobrado);
+
+        document.getElementById('ec-facturado').textContent = money(totalFacturado);
+        document.getElementById('ec-cobrado').textContent = money(totalCobrado);
+        document.getElementById('ec-saldo').textContent = money(saldo);
+        document.getElementById('ec-vencido').textContent = money(vencido);
+
+        const tbodyF = document.getElementById('ec-tbody-facturas');
+        const ordenFacturas = [...facturas].sort((a,b)=>(b.fecha_emision||'').localeCompare(a.fecha_emision||''));
+        if (!ordenFacturas.length) {
+            tbodyF.innerHTML = `<tr><td colspan="6"><div class="empty" style="padding:16px 10px"><p>Sin facturas vinculadas</p></div></td></tr>`;
+        } else {
+            tbodyF.innerHTML = ordenFacturas.map(f => {
+                const est = estadoFacturaLabel(f);
+                const badge = est === 'pagada' ? 'b-ok' : (est === 'vencida' ? 'b-danger' : (est === 'anulada' ? 'b-gray' : 'b-warn'));
+                return `<tr>
+                    <td><span class="chip">${f.numero||f.id.slice(0,8)}</span></td>
+                    <td style="color:var(--muted)">${f.fecha_emision||'—'}</td>
+                    <td style="color:${est==='vencida'?'var(--danger)':'var(--muted)'}">${f.fecha_vencimiento||'—'}</td>
+                    <td style="font-family:'DM Mono',monospace;font-weight:600">${money(f.total||0)}</td>
+                    <td><span class="badge ${badge}">${est}</span></td>
+                    <td style="color:var(--muted)">${f.fecha_pago||'—'}</td>
+                </tr>`;
+            }).join('');
+        }
+
+        const tbodyP = document.getElementById('ec-tbody-pagos');
+        const ordenPagos = [...pagos].sort((a,b)=>(b.fecha||'').localeCompare(a.fecha||''));
+        if (!ordenPagos.length) {
+            tbodyP.innerHTML = `<tr><td colspan="5"><div class="empty" style="padding:16px 10px"><p>Sin pagos vinculados. Tip: registrar movimientos con cliente_id para trazabilidad total.</p></div></td></tr>`;
+        } else {
+            tbodyP.innerHTML = ordenPagos.map(p => `
+                <tr>
+                    <td style="color:var(--muted)">${p.fecha||'—'}</td>
+                    <td><span class="badge ${p.tipo==='ingreso'?'b-ok':'b-danger'}">${p.tipo||'—'}</span></td>
+                    <td>${p.concepto||'—'}</td>
+                    <td>${p.metodo||'—'}</td>
+                    <td style="font-family:'DM Mono',monospace;font-weight:600">${money(p.monto||0)}</td>
+                </tr>
+            `).join('');
+        }
+    } catch (e) {
+        document.getElementById('ec-facturado').textContent = '—';
+        document.getElementById('ec-cobrado').textContent = '—';
+        document.getElementById('ec-saldo').textContent = '—';
+        document.getElementById('ec-vencido').textContent = '—';
+        document.getElementById('ec-tbody-facturas').innerHTML = `<tr><td colspan="6" style="color:var(--danger)">No se pudo cargar el estado de cuenta: ${e.message}</td></tr>`;
+        document.getElementById('ec-tbody-pagos').innerHTML = `<tr><td colspan="5" style="color:var(--muted)">—</td></tr>`;
+    }
+};
+
+function abrirNuevo() {
+    editId = null;
+    document.getElementById('modal-title').textContent = 'Nuevo cliente';
+    ['f-nombre','f-dni','f-email','f-tel','f-dir','f-notas'].forEach(id => document.getElementById(id).value='');
+    document.getElementById('f-tipo').value = 'particular';
+    openModal('modal-cli');
+}
+
+window.editar = function(id) {
+    const c = clientes.find(x=>x.id===id); if (!c) return;
+    editId = id;
+    document.getElementById('modal-title').textContent = 'Editar cliente';
+    document.getElementById('f-nombre').value = c.nombre||'';
+    document.getElementById('f-tipo').value   = c.tipo||'particular';
+    document.getElementById('f-dni').value    = c.dni||'';
+    document.getElementById('f-email').value  = c.email||'';
+    document.getElementById('f-tel').value    = c.telefono||'';
+    document.getElementById('f-dir').value    = c.direccion||'';
+    document.getElementById('f-notas').value  = c.notas||'';
+    openModal('modal-cli');
+};
+
+async function guardar() {
+    const nombre = document.getElementById('f-nombre').value.trim();
+    if (!nombre) { toast('El nombre es obligatorio','err'); return; }
+    const btn = document.getElementById('btn-guardar');
+    btn.disabled=true; btn.textContent='Guardando…';
+    const data = {
+        nombre, tipo: document.getElementById('f-tipo').value,
+        dni: document.getElementById('f-dni').value.trim(),
+        email: document.getElementById('f-email').value.trim(),
+        telefono: document.getElementById('f-tel').value.trim(),
+        direccion: document.getElementById('f-dir').value.trim(),
+        notas: document.getElementById('f-notas').value.trim(),
+        activo: true, updated_at: serverTimestamp(),
+    };
+    try {
+        if (editId) { await updateDoc(doc(db,'clientes',editId), data); toast('Cliente actualizado'); }
+        else { data.created_at = serverTimestamp(); data.empresa_id = currentEmpresaId; await addDoc(collection(db,'clientes'), data); toast('Cliente creado'); }
+        closeModal('modal-cli');
+        await cargar();
+    } catch(e) { toast('Error: '+e.message,'err'); }
+    finally { btn.disabled=false; btn.textContent='Guardar'; }
+}
+
+window.eliminar = async function(id, nombre) {
+    if (!ask(`¿Eliminar a "${nombre}"?`)) return;
+    await updateDoc(doc(db,'clientes',id), {activo:false});
+    toast('Cliente eliminado','wrn');
+    await cargar();
+};
+</script>
+</body>
+</html>

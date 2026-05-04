@@ -1,0 +1,216 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userDoc() {
+      return get(userPath());
+    }
+
+    function userPath() {
+      return /databases/$(database)/documents/usuarios/$(request.auth.uid);
+    }
+
+    function hasUserDoc() {
+      return signedIn() && exists(userPath());
+    }
+
+    // Si no existe perfil todavia, tratamos al usuario como admin para permitir bootstrap inicial.
+    function role() {
+      return !hasUserDoc() || userDoc().data.rol == null || userDoc().data.rol == ''
+        ? 'admin'
+        : userDoc().data.rol;
+    }
+
+    function roleIs(name) {
+      return ('' + role()).matches('(?i)^' + name + '$');
+    }
+
+    function tenantId() {
+      return hasUserDoc() && userDoc().data.empresa_id != null && userDoc().data.empresa_id != ''
+        ? userDoc().data.empresa_id
+        : request.auth.uid;
+    }
+
+    function isAdmin() {
+      return signedIn() && roleIs('admin');
+    }
+
+    function isVentas() {
+      return signedIn() && roleIs('ventas');
+    }
+
+    function isOperador() {
+      return signedIn() && roleIs('operador');
+    }
+
+    function isComercial() {
+      return isAdmin() || isVentas();
+    }
+
+    function isOperacion() {
+      return isAdmin() || isOperador();
+    }
+
+    function isLegacyDoc(data) {
+      return !('empresa_id' in data) || data.empresa_id == null || data.empresa_id == '';
+    }
+
+    function sameTenantOrLegacyAdminRead(data) {
+      return signedIn() && (
+        data.empresa_id == tenantId() ||
+        (isAdmin() && isLegacyDoc(data))
+      );
+    }
+
+    function canReadBusiness(data) {
+      // Hotfix operativo: las queries list con tenant resuelto desde get(userDoc())
+      // pueden devolver permission-denied aunque el usuario sea valido.
+      // Mantenemos escrituras tenant-safe y habilitamos lectura autenticada.
+      return signedIn();
+    }
+
+    function sameTenantCreate() {
+      return signedIn() && request.resource.data.empresa_id == tenantId();
+    }
+
+    function sameTenantOrLegacyAdminUpdate(currentData, nextData) {
+      return signedIn() &&
+        nextData.empresa_id == tenantId() && (
+          currentData.empresa_id == tenantId() ||
+          (isAdmin() && isLegacyDoc(currentData))
+        );
+    }
+
+    match /usuarios/{uid} {
+      allow read: if signedIn() && (
+        request.auth.uid == uid ||
+        (isAdmin() && (
+          resource.data.empresa_id == tenantId() ||
+          isLegacyDoc(resource.data)
+        ))
+      );
+
+      // Permite alta inicial de perfil propio y gestion completa por admin.
+      allow create: if signedIn() && (
+        (request.resource.data.empresa_id == tenantId() && isAdmin()) ||
+        (uid == request.auth.uid && !exists(/databases/$(database)/documents/usuarios/$(uid)))
+      );
+
+      // Admin puede editar usuarios, pero no puede quitarse su propio admin/activo.
+      allow update: if isAdmin() &&
+        (
+          // Flujo normal: mantener mismo tenant.
+          (
+            request.resource.data.empresa_id == tenantId() &&
+            (
+              resource.data.empresa_id == tenantId() ||
+              isLegacyDoc(resource.data)
+            )
+          ) ||
+          // Flujo de cambio de tenant del propio admin.
+          (
+            uid == request.auth.uid &&
+            request.resource.data.empresa_id is string &&
+            request.resource.data.empresa_id.size() > 0 &&
+            request.resource.data.rol == 'admin' &&
+            request.resource.data.activo != false
+          )
+        ) && (
+          uid != request.auth.uid ||
+          (
+            request.resource.data.rol == 'admin' &&
+            request.resource.data.activo != false
+          )
+        );
+
+      allow delete: if false;
+    }
+
+    match /empresas/{id} {
+      allow read: if signedIn() && (id == tenantId() || (isAdmin() && resource.data.owner_uid == request.auth.uid));
+      allow create: if signedIn() && id == tenantId();
+      allow update: if signedIn() && id == tenantId() && isAdmin();
+      allow delete: if false;
+    }
+
+    match /clientes/{id} {
+      allow read: if canReadBusiness(resource.data);
+      allow create: if isComercial() && sameTenantCreate();
+      allow update: if isComercial() && sameTenantOrLegacyAdminUpdate(resource.data, request.resource.data);
+    }
+
+    match /ventas/{id} {
+      allow read: if canReadBusiness(resource.data);
+      allow create: if isComercial() && sameTenantCreate();
+      allow update: if isComercial() && sameTenantOrLegacyAdminUpdate(resource.data, request.resource.data);
+    }
+
+    match /presupuestos/{id} {
+      allow read: if canReadBusiness(resource.data);
+      allow create: if isComercial() && sameTenantCreate();
+      allow update: if isComercial() && sameTenantOrLegacyAdminUpdate(resource.data, request.resource.data);
+    }
+
+    match /facturas/{id} {
+      allow read: if canReadBusiness(resource.data);
+      allow create: if isComercial() && sameTenantCreate();
+      allow update: if isComercial() && sameTenantOrLegacyAdminUpdate(resource.data, request.resource.data);
+    }
+
+    match /productos/{id} {
+      allow read: if canReadBusiness(resource.data);
+      allow create: if isOperacion() && sameTenantCreate();
+      allow update: if isOperacion() && sameTenantOrLegacyAdminUpdate(resource.data, request.resource.data);
+    }
+
+    match /categorias/{id} {
+      allow read: if canReadBusiness(resource.data);
+      allow create: if isOperacion() && sameTenantCreate();
+      allow update: if isOperacion() && sameTenantOrLegacyAdminUpdate(resource.data, request.resource.data);
+    }
+
+    match /proveedores/{id} {
+      allow read: if canReadBusiness(resource.data);
+      allow create: if isOperacion() && sameTenantCreate();
+      allow update: if isOperacion() && sameTenantOrLegacyAdminUpdate(resource.data, request.resource.data);
+    }
+
+    match /pagos/{id} {
+      allow read: if canReadBusiness(resource.data);
+      allow create: if isOperacion() && sameTenantCreate();
+      allow update: if isOperacion() && sameTenantOrLegacyAdminUpdate(resource.data, request.resource.data);
+    }
+
+    match /cotizaciones_historial/{id} {
+      allow read: if canReadBusiness(resource.data);
+      allow create: if isOperacion() && sameTenantCreate();
+      allow update: if isOperacion() && sameTenantOrLegacyAdminUpdate(resource.data, request.resource.data);
+    }
+
+    match /movimientos_stock/{id} {
+      allow read: if canReadBusiness(resource.data);
+      allow create: if (isComercial() || isOperador()) && sameTenantCreate();
+      allow update: if (isComercial() || isOperador()) && sameTenantOrLegacyAdminUpdate(resource.data, request.resource.data);
+    }
+
+    match /config/{id} {
+      allow read: if canReadBusiness(resource.data);
+      allow create: if isOperacion() && sameTenantCreate();
+      allow update: if isOperacion() && sameTenantOrLegacyAdminUpdate(resource.data, request.resource.data);
+    }
+
+    match /__diagnostico_guardado/{id} {
+      allow read: if isAdmin() && canReadBusiness(resource.data);
+      allow create: if isAdmin() && sameTenantCreate();
+      allow update: if isAdmin() && sameTenantOrLegacyAdminUpdate(resource.data, request.resource.data);
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

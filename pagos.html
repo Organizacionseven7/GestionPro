@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pagos / Caja — GestiónPro</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="app"></div>
+<div id="toasts"></div>
+
+<script type="module">
+import { auth, db } from './js/firebase-config.js';
+import { onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { collection, doc, getDocs, addDoc, updateDoc, query, where, orderBy, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-lite.js";
+import { renderSidebar } from './js/sidebar.js';
+import { toast, openModal, closeModal, money, ask } from './js/utils.js';
+import { ensureUserActive } from './js/access-control.js';
+import { ensureRoleAllowed } from './js/access-control.js';
+import { getEmpresaId } from './js/access-control.js';
+
+let pagos = [];
+let clientes = [];
+let currentEmpresaId = null;
+
+onAuthStateChanged(auth, async user => {
+    if (!user) { window.location.href='login.html'; return; }
+    if (!(await ensureUserActive(auth, db, user))) return;
+    if (!(await ensureRoleAllowed(db, user, ['admin', 'operador']))) return;
+    currentEmpresaId = getEmpresaId() || user.uid;
+    renderApp();
+    document.getElementById('btn-logout').addEventListener('click', ()=>signOut(auth).then(()=>location.href='login.html'));
+    document.getElementById('user-name').textContent = user.email;
+    document.getElementById('user-avatar').textContent = user.email[0].toUpperCase();
+    await cargarClientes();
+    await cargar();
+});
+
+function renderApp() {
+    document.getElementById('app').innerHTML = `
+        ${renderSidebar('pagos')}
+        <main class="main">
+            <header class="topbar">
+                <div style="display:flex;align-items:center;gap:10px">
+                    <button class="btn btn-ghost btn-sm btn-menu">☰</button>
+                    <span class="topbar-title">Pagos / Caja</span>
+                </div>
+                <button class="btn btn-primary" id="btn-nuevo">+ Nuevo movimiento</button>
+            </header>
+
+            <div class="page">
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-bottom:18px">
+                    <div class="card" style="padding:14px">
+                        <div style="font-size:11px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">Hoy</div>
+                        <div style="display:grid;grid-template-columns:repeat(3,minmax(90px,1fr));gap:10px">
+                            <div><div style="font-size:11px;color:var(--muted)">Ingresos</div><div id="h-in" style="font-family:'DM Mono',monospace;font-weight:700;color:var(--success)">$0,00</div></div>
+                            <div><div style="font-size:11px;color:var(--muted)">Egresos</div><div id="h-out" style="font-family:'DM Mono',monospace;font-weight:700;color:var(--danger)">$0,00</div></div>
+                            <div><div style="font-size:11px;color:var(--muted)">Saldo</div><div id="h-saldo" style="font-family:'DM Mono',monospace;font-weight:700;color:var(--accent)">$0,00</div></div>
+                        </div>
+                    </div>
+                    <div class="card" style="padding:14px">
+                        <div style="font-size:11px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">Mes actual</div>
+                        <div style="display:grid;grid-template-columns:repeat(3,minmax(90px,1fr));gap:10px">
+                            <div><div style="font-size:11px;color:var(--muted)">Ingresos</div><div id="m-in" style="font-family:'DM Mono',monospace;font-weight:700;color:var(--success)">$0,00</div></div>
+                            <div><div style="font-size:11px;color:var(--muted)">Egresos</div><div id="m-out" style="font-family:'DM Mono',monospace;font-weight:700;color:var(--danger)">$0,00</div></div>
+                            <div><div style="font-size:11px;color:var(--muted)">Saldo</div><div id="m-saldo" style="font-family:'DM Mono',monospace;font-weight:700;color:var(--accent)">$0,00</div></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Movimientos de caja</h2>
+                        <div style="display:flex;gap:8px;flex-wrap:wrap">
+                            <input class="inp" id="f-desde" type="date" style="width:auto" onchange="window.filtrar()">
+                            <input class="inp" id="f-hasta" type="date" style="width:auto" onchange="window.filtrar()">
+                            <select class="inp" id="f-tipo" style="width:auto" onchange="window.filtrar()">
+                                <option value="">Todos los tipos</option>
+                                <option value="ingreso">Ingreso</option>
+                                <option value="egreso">Egreso</option>
+                            </select>
+                            <select class="inp" id="f-metodo" style="width:auto" onchange="window.filtrar()">
+                                <option value="">Todos los métodos</option>
+                                <option value="efectivo">Efectivo</option>
+                                <option value="transferencia">Transferencia</option>
+                                <option value="tarjeta">Tarjeta</option>
+                                <option value="cheque">Cheque</option>
+                                <option value="billetera">Billetera virtual</option>
+                                <option value="otro">Otro</option>
+                            </select>
+                            <input class="inp inp-search" id="busca" placeholder="Concepto…" oninput="window.filtrar()">
+                        </div>
+                    </div>
+                    <div class="table-wrap">
+                        <table>
+                            <thead><tr><th>Fecha</th><th>Tipo</th><th>Concepto</th><th>Cliente</th><th>Método</th><th>Monto</th><th>Acciones</th></tr></thead>
+                            <tbody id="tbody"></tbody>
+                        </table>
+                    </div>
+                    <div class="pag"><span id="pag-info">—</span></div>
+                </div>
+            </div>
+        </main>
+
+        <div class="overlay" id="modal-pago">
+            <div class="modal">
+                <div class="modal-head">
+                    <h3>Nuevo movimiento</h3>
+                    <button class="btn btn-ghost btn-sm" onclick="closeModal('modal-pago')">✕</button>
+                </div>
+                <div class="modal-body">
+                    <div class="form-grid">
+                        <div class="fgroup"><label>Tipo</label>
+                            <select class="inp" id="n-tipo">
+                                <option value="ingreso">Ingreso</option>
+                                <option value="egreso">Egreso</option>
+                            </select>
+                        </div>
+                        <div class="fgroup"><label>Fecha</label><input class="inp" id="n-fecha" type="date"></div>
+                        <div class="fgroup full"><label>Concepto *</label><input class="inp" id="n-concepto"></div>
+                        <div class="fgroup full"><label>Cliente (opcional)</label>
+                            <select class="inp" id="n-cliente"><option value="">Sin cliente</option></select>
+                        </div>
+                        <div class="fgroup"><label>Método de pago</label>
+                            <select class="inp" id="n-metodo">
+                                <option value="efectivo">Efectivo</option>
+                                <option value="transferencia">Transferencia</option>
+                                <option value="tarjeta">Tarjeta</option>
+                                <option value="cheque">Cheque</option>
+                                <option value="billetera">Billetera virtual</option>
+                                <option value="otro">Otro</option>
+                            </select>
+                        </div>
+                        <div class="fgroup"><label>Monto *</label><input class="inp" id="n-monto" type="number" min="0" step="0.01"></div>
+                        <div class="fgroup full"><label>Notas</label><textarea class="inp" id="n-notas"></textarea></div>
+                    </div>
+                </div>
+                <div class="modal-foot">
+                    <button class="btn btn-ghost" onclick="closeModal('modal-pago')">Cancelar</button>
+                    <button class="btn btn-primary" id="btn-guardar">Guardar</button>
+                </div>
+            </div>
+        </div>`;
+
+    document.getElementById('btn-nuevo').addEventListener('click', abrirNuevo);
+    document.getElementById('btn-guardar').addEventListener('click', guardar);
+    document.querySelector('.btn-menu').addEventListener('click', ()=>document.querySelector('.sidebar').classList.toggle('open'));
+}
+
+async function cargarClientes() {
+    const snap = await getDocs(query(collection(db,'clientes'), where('empresa_id','==',currentEmpresaId), where('activo','==',true)));
+    clientes = snap.docs
+        .map(d=>({id:d.id, ...d.data()}))
+        .sort((a,b)=>(a.nombre||'').localeCompare((b.nombre||''), 'es', { sensitivity:'base' }));
+    const sel = document.getElementById('n-cliente');
+    if (!sel) return;
+    sel.innerHTML = '<option value="">Sin cliente</option>';
+    clientes.forEach(c => {
+        sel.innerHTML += `<option value="${c.id}">${c.nombre}</option>`;
+    });
+}
+
+async function cargar() {
+    const snap = await getDocs(query(collection(db,'pagos'), where('empresa_id','==',currentEmpresaId), orderBy('created_at','desc')));
+    pagos = snap.docs.map(d=>({id:d.id,...d.data()})).filter(p=>!p.anulado);
+    actualizarKPIs();
+    filtrar();
+}
+
+function actualizarKPIs() {
+    const hoy = new Date().toISOString().split('T')[0];
+    const ym = hoy.slice(0,7);
+
+    const hoyLista = pagos.filter(p=>p.fecha===hoy);
+    const mesLista = pagos.filter(p=>(p.fecha||'').startsWith(ym));
+
+    const sum = (arr,tipo)=>arr.filter(x=>x.tipo===tipo).reduce((a,x)=>a+(x.monto||0),0);
+
+    const hIn = sum(hoyLista,'ingreso');
+    const hOut = sum(hoyLista,'egreso');
+    const mIn = sum(mesLista,'ingreso');
+    const mOut = sum(mesLista,'egreso');
+
+    document.getElementById('h-in').textContent = money(hIn);
+    document.getElementById('h-out').textContent = money(hOut);
+    document.getElementById('h-saldo').textContent = money(hIn-hOut);
+
+    document.getElementById('m-in').textContent = money(mIn);
+    document.getElementById('m-out').textContent = money(mOut);
+    document.getElementById('m-saldo').textContent = money(mIn-mOut);
+}
+
+window.filtrar = function() {
+    const desde = document.getElementById('f-desde').value;
+    const hasta = document.getElementById('f-hasta').value;
+    const tipo = document.getElementById('f-tipo').value;
+    const metodo = document.getElementById('f-metodo').value;
+    const q = document.getElementById('busca').value.toLowerCase();
+
+    const lista = pagos.filter(p => {
+        const okDesde = !desde || (p.fecha && p.fecha >= desde);
+        const okHasta = !hasta || (p.fecha && p.fecha <= hasta);
+        const okTipo = !tipo || p.tipo === tipo;
+        const okMetodo = !metodo || p.metodo === metodo;
+        const okQ = !q || p.concepto?.toLowerCase().includes(q);
+        return okDesde && okHasta && okTipo && okMetodo && okQ;
+    });
+
+    const tbody = document.getElementById('tbody');
+    document.getElementById('pag-info').textContent = `${lista.length} movimiento${lista.length!==1?'s':''}`;
+
+    if (!lista.length) {
+        tbody.innerHTML = `<tr><td colspan="7"><div class="empty"><div class="eicon">◎</div><p>Sin movimientos para el filtro aplicado</p></div></td></tr>`;
+        return;
+    }
+
+    tbody.innerHTML = lista.map(p=>`<tr>
+        <td style="color:var(--muted)">${p.fecha||'—'}</td>
+        <td><span class="badge ${p.tipo==='ingreso'?'b-ok':'b-danger'}">${p.tipo}</span></td>
+        <td>${p.concepto||'—'}</td>
+        <td>${p.cliente_nombre||'<span style="color:var(--muted)">—</span>'}</td>
+        <td>${p.metodo||'—'}</td>
+        <td style="font-family:'DM Mono',monospace;font-weight:600">${money(p.monto)}</td>
+        <td><button class="btn btn-danger btn-sm" onclick="window.eliminar('${p.id}')">✕</button></td>
+    </tr>`).join('');
+};
+
+function abrirNuevo() {
+    document.getElementById('n-tipo').value = 'ingreso';
+    document.getElementById('n-fecha').value = new Date().toISOString().split('T')[0];
+    document.getElementById('n-concepto').value = '';
+    document.getElementById('n-cliente').value = '';
+    document.getElementById('n-metodo').value = 'efectivo';
+    document.getElementById('n-monto').value = '';
+    document.getElementById('n-notas').value = '';
+    openModal('modal-pago');
+}
+
+async function guardar() {
+    const concepto = document.getElementById('n-concepto').value.trim();
+    const monto = parseFloat(document.getElementById('n-monto').value)||0;
+    const clienteId = document.getElementById('n-cliente').value;
+    const cliente = clientes.find(c => c.id === clienteId);
+    if (!concepto || monto <= 0) { toast('Concepto y monto son obligatorios','err'); return; }
+
+    const btn = document.getElementById('btn-guardar');
+    btn.disabled = true;
+    btn.textContent = 'Guardando…';
+
+    const data = {
+        empresa_id: currentEmpresaId,
+        tipo: document.getElementById('n-tipo').value,
+        fecha: document.getElementById('n-fecha').value,
+        concepto,
+        cliente_id: clienteId || null,
+        cliente_nombre: cliente?.nombre || null,
+        metodo: document.getElementById('n-metodo').value,
+        monto,
+        notas: document.getElementById('n-notas').value.trim(),
+        created_at: serverTimestamp(),
+    };
+
+    try {
+        await addDoc(collection(db,'pagos'), data);
+        toast('Movimiento registrado');
+        closeModal('modal-pago');
+        await cargar();
+    } catch(e) {
+        toast('Error: ' + e.message, 'err');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Guardar';
+    }
+}
+
+window.eliminar = async function(id) {
+    if (!ask('¿Anular este movimiento?')) return;
+    await updateDoc(doc(db,'pagos',id), {anulado:true});
+    toast('Movimiento anulado','wrn');
+    await cargar();
+};
+</script>
+</body>
+</html>

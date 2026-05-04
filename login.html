@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Iniciar sesión — GestiónPro</title>
+    <link rel="stylesheet" href="css/style.css">
+    <style>
+        .login-logo { font-size:36px; margin-bottom:6px; }
+        .divider { height:1px; background:var(--border); margin:20px 0; }
+        .error-msg { color:var(--danger); font-size:12px; margin-top:8px; min-height:18px; }
+        .actions-row { display:flex; justify-content:flex-end; margin-top:8px; }
+        .pw-wrap { position:relative; }
+        .pw-wrap .inp { padding-right:78px; }
+        .pw-btn {
+            position:absolute;
+            right:8px;
+            top:50%;
+            transform:translateY(-50%);
+            border:none;
+            background:transparent;
+            color:var(--muted);
+            font-size:12px;
+            font-weight:600;
+            cursor:pointer;
+            padding:2px 4px;
+        }
+        .link-btn {
+            background:none;
+            border:none;
+            color:var(--accent);
+            font-size:12px;
+            font-weight:600;
+            cursor:pointer;
+            padding:0;
+        }
+        .link-btn:disabled { opacity:.5; cursor:not-allowed; }
+    </style>
+</head>
+<body style="display:flex;align-items:center;justify-content:center;min-height:100vh">
+
+<div class="login-box">
+    <div class="login-logo">⬡</div>
+    <h1>GestiónPro</h1>
+    <p>Ingresá tus credenciales para continuar</p>
+
+    <div class="fgroup" style="margin-bottom:12px">
+        <label>Email</label>
+        <input class="inp" type="email" id="email" placeholder="tu@email.com" autocomplete="email">
+    </div>
+    <div class="fgroup" style="margin-bottom:6px">
+        <label>Contraseña</label>
+        <div class="pw-wrap">
+            <input class="inp" type="password" id="password" placeholder="••••••••" autocomplete="current-password">
+            <button type="button" class="pw-btn" id="btn-toggle-password" aria-label="Mostrar contraseña">Mostrar</button>
+        </div>
+    </div>
+    <div class="error-msg" id="error-msg"></div>
+    <div class="actions-row">
+        <button type="button" class="link-btn" id="btn-reset">Olvidé mi contraseña</button>
+    </div>
+
+    <button class="btn btn-primary" id="btn-login" style="width:100%;margin-top:10px;justify-content:center;padding:11px">
+        Ingresar al sistema
+    </button>
+
+    <div class="divider"></div>
+    <p style="font-size:12px;color:var(--muted);text-align:center">
+        ¿Problemas para ingresar? Contactá al administrador del sistema.
+    </p>
+</div>
+
+<div id="toasts"></div>
+
+<script type="module">
+    import { auth, db } from './js/firebase-config.js';
+    import { signInWithEmailAndPassword, onAuthStateChanged, sendPasswordResetEmail } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+    import { doc, getDoc, setDoc, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-lite.js";
+    import { toast } from './js/utils.js';
+
+    async function usuarioActivo(uid) {
+        try {
+            const snap = await getDoc(doc(db, 'usuarios', uid));
+            if (!snap.exists()) return true;
+            const data = snap.data() || {};
+            return data.activo !== false;
+        } catch {
+            // Si hay un error temporal de red, no bloqueamos el acceso por defecto.
+            return true;
+        }
+    }
+
+    async function asegurarPerfilEmpresa(user) {
+        const userRef = doc(db, 'usuarios', user.uid);
+        const snap = await getDoc(userRef);
+        const empresaId = user.uid;
+
+        if (!snap.exists()) {
+            await setDoc(userRef, {
+                nombre: user.email?.split('@')[0] || 'Administrador',
+                email: user.email || '',
+                rol: 'admin',
+                activo: true,
+                empresa_id: empresaId,
+                created_at: serverTimestamp(),
+                updated_at: serverTimestamp(),
+                creado_por: user.uid,
+            }, { merge: true });
+        } else {
+            const data = snap.data() || {};
+            if (!data.empresa_id) {
+                await setDoc(userRef, {
+                    empresa_id: empresaId,
+                    updated_at: serverTimestamp(),
+                }, { merge: true });
+            }
+        }
+
+        await setDoc(doc(db, 'empresas', empresaId), {
+            nombre: (user.email || 'Empresa').split('@')[0],
+            owner_uid: user.uid,
+            owner_email: user.email || '',
+            activo: true,
+            created_at: serverTimestamp(),
+            updated_at: serverTimestamp(),
+        }, { merge: true });
+    }
+
+    // Si ya está logueado, solo redirigir si el usuario está activo.
+    onAuthStateChanged(auth, async user => {
+        if (!user) return;
+        const activo = await usuarioActivo(user.uid);
+        if (activo) {
+            window.location.href = 'index.html';
+            return;
+        }
+        await auth.signOut();
+        errMsg.textContent = 'Tu usuario está desactivado. Contactá al administrador.';
+    });
+
+    const btn = document.getElementById('btn-login');
+    const resetBtn = document.getElementById('btn-reset');
+    const errMsg = document.getElementById('error-msg');
+    const passwordInput = document.getElementById('password');
+    const togglePasswordBtn = document.getElementById('btn-toggle-password');
+
+    function setPasswordVisibility(visible) {
+        if (!passwordInput || !togglePasswordBtn) return;
+        passwordInput.type = visible ? 'text' : 'password';
+        togglePasswordBtn.textContent = visible ? 'Ocultar' : 'Mostrar';
+        togglePasswordBtn.setAttribute('aria-label', visible ? 'Ocultar contraseña' : 'Mostrar contraseña');
+    }
+
+    togglePasswordBtn?.addEventListener('click', () => {
+        const visible = passwordInput?.type === 'text';
+        setPasswordVisibility(!visible);
+    });
+    const motivo = new URLSearchParams(window.location.search).get('motivo');
+    if (motivo === 'inactivo') {
+        errMsg.textContent = 'Tu usuario está desactivado. Contactá al administrador.';
+    }
+
+    async function login() {
+        const email = document.getElementById('email').value.trim();
+        const pass  = document.getElementById('password').value;
+        errMsg.textContent = '';
+
+        if (!email || !pass) { errMsg.textContent = 'Completá todos los campos'; return; }
+
+        btn.disabled = true;
+        btn.textContent = 'Ingresando…';
+
+        try {
+            const cred = await signInWithEmailAndPassword(auth, email, pass);
+            await asegurarPerfilEmpresa(cred.user);
+            const activo = await usuarioActivo(cred.user.uid);
+            if (!activo) {
+                await auth.signOut();
+                errMsg.textContent = 'Tu usuario está desactivado. Contactá al administrador.';
+                btn.disabled = false;
+                btn.textContent = 'Ingresar al sistema';
+                return;
+            }
+            window.location.href = 'index.html';
+        } catch (e) {
+            const msgs = {
+                'auth/user-not-found':   'Usuario no encontrado',
+                'auth/wrong-password':   'Contraseña incorrecta',
+                'auth/invalid-email':    'Email inválido',
+                'auth/too-many-requests':'Demasiados intentos. Esperá unos minutos.',
+            };
+            errMsg.textContent = msgs[e.code] || 'Error al iniciar sesión';
+            btn.disabled = false;
+            btn.textContent = 'Ingresar al sistema';
+        }
+    }
+
+    async function resetPassword() {
+        const email = document.getElementById('email').value.trim();
+        errMsg.textContent = '';
+
+        if (!email) {
+            errMsg.textContent = 'Ingresá tu email para recuperar la contraseña';
+            return;
+        }
+
+        resetBtn.disabled = true;
+        const oldText = resetBtn.textContent;
+        resetBtn.textContent = 'Enviando...';
+
+        try {
+            await sendPasswordResetEmail(auth, email);
+            toast('Te enviamos un enlace para restablecer la contraseña', 'ok');
+        } catch (e) {
+            const msgs = {
+                'auth/invalid-email': 'Email inválido',
+                'auth/user-not-found': 'No existe una cuenta con ese email',
+                'auth/too-many-requests': 'Demasiados intentos. Probá de nuevo en unos minutos.'
+            };
+            errMsg.textContent = msgs[e.code] || 'No se pudo enviar el correo de recuperación';
+        } finally {
+            resetBtn.disabled = false;
+            resetBtn.textContent = oldText;
+        }
+    }
+
+    btn.addEventListener('click', login);
+    resetBtn.addEventListener('click', resetPassword);
+    document.getElementById('email').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
+    document.getElementById('password').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
+</script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+# Firebase cache and logs
+firebase-debug.log
+firebase-debug.*.log
+
+# VCS
+.git
+.gitignore
+
+# Dependencies
+node_modules
+
+# Local temp data
+_tmp_*
+*.tmp

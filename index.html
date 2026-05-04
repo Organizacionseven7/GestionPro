@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard — GestiónPro</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="app"></div>
+<div id="toasts"></div>
+
+<script type="module">
+import { auth } from './js/firebase-config.js';
+import { db } from './js/firebase-config.js';
+import { onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { collection, getDocs, query, where, Timestamp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-lite.js";
+import { renderSidebar } from './js/sidebar.js';
+import { money, nowDate, toast } from './js/utils.js';
+import { ensureUserActive, ensureRoleAllowed } from './js/access-control.js';
+import { getEmpresaId } from './js/access-control.js';
+
+let currentEmpresaId = null;
+
+onAuthStateChanged(auth, async user => {
+    if (!user) { window.location.href = 'login.html'; return; }
+    if (!(await ensureUserActive(auth, db, user))) return;
+    if (!(await ensureRoleAllowed(db, user, ['admin', 'ventas', 'operador']))) return;
+    currentEmpresaId = getEmpresaId() || user.uid;
+    const motivo = new URLSearchParams(window.location.search).get('motivo');
+    if (motivo === 'sin_permiso') toast('No tenes permisos para acceder a ese modulo', 'wrn');
+    renderApp(user);
+    await loadKPIs();
+});
+
+function renderApp(user) {
+    const role = (sessionStorage.getItem('gp_user_role') || 'admin').toLowerCase();
+    document.getElementById('app').innerHTML = `
+        ${renderSidebar('dashboard')}
+        <main class="main">
+            <header class="topbar">
+                <span class="topbar-title">Dashboard</span>
+                <span style="font-size:12px;color:var(--muted)">${nowDate()}</span>
+            </header>
+            <div class="page">
+                <div id="setup-alert" class="card" style="display:none;margin-bottom:14px;border-color:var(--warning)">
+                    <div class="card-header">
+                        <h2>Revisión de configuración</h2>
+                    </div>
+                    <div style="padding:12px">
+                        <div id="setup-alert-text" style="font-size:13px;color:var(--text);line-height:1.45"></div>
+                        <div id="setup-alert-actions" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"></div>
+                    </div>
+                </div>
+
+                <div style="margin-bottom:22px">
+                    <h2 style="font-size:21px;font-weight:700;margin-bottom:3px">Bienvenido 👋</h2>
+                    <p style="color:var(--muted);font-size:13px">Resumen general de tu negocio</p>
+                </div>
+
+                <div class="stats-grid">
+                    <div class="stat-card c-accent">
+                        <div class="slabel">Ventas hoy</div>
+                        <div class="sval" id="kpi-hoy">…</div>
+                    </div>
+                    <div class="stat-card c-accent">
+                        <div class="slabel">Ventas del mes</div>
+                        <div class="sval" style="font-size:20px" id="kpi-mes">…</div>
+                    </div>
+                    <div class="stat-card c-ok">
+                        <div class="slabel">Clientes</div>
+                        <div class="sval" id="kpi-clientes">…</div>
+                    </div>
+                    <div class="stat-card c-warn">
+                        <div class="slabel">Stock bajo</div>
+                        <div class="sval" id="kpi-stock">…</div>
+                        <div class="ssub">con alerta de mínimo</div>
+                    </div>
+                    <div class="stat-card c-warn">
+                        <div class="slabel">Facturas pendientes</div>
+                        <div class="sval" id="kpi-facturas">…</div>
+                    </div>
+                    <div class="stat-card c-ok">
+                        <div class="slabel">Presupuestos activos</div>
+                        <div class="sval" id="kpi-presup">…</div>
+                    </div>
+                </div>
+
+                <h3 style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin-bottom:10px">Acceso rápido</h3>
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:24px">
+                    ${[
+                        ['ventas.html','◎','Nueva venta','Punto de venta',['admin','ventas','operador']],
+                        ['presupuestos.html','◇','Presupuesto','Crear y enviar',['admin','ventas','operador']],
+                        ['facturas.html','▣','Factura','Agendar / emitir',['admin','ventas','operador']],
+                        ['clientes.html','◉','Clientes','Ver y agregar',['admin','ventas','operador']],
+                        ['productos.html','▦','Productos','Inventario',['admin','ventas','operador']],
+                        ['pagos.html','◎','Caja','Pagos y cobros',['admin','ventas','operador']],
+                        ['migracion-multiempresa.html','⇄','Migracion tenant','Completar empresa_id',['admin']],
+                    ].filter(([, , , , roles]) => !roles || roles.includes(role)).map(([href,icon,title,sub]) => `
+                        <a href="${href}" class="card" style="padding:18px;text-decoration:none;display:flex;flex-direction:column;gap:7px;transition:border-color .2s" onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--border)'">
+                            <div style="font-size:26px">${icon}</div>
+                            <div style="font-weight:600;font-size:13px">${title}</div>
+                            <div style="font-size:11px;color:var(--muted)">${sub}</div>
+                        </a>`).join('')}
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h2>📅 Próximas facturas a vencer</h2>
+                        <a href="facturas.html" class="btn btn-ghost btn-sm">Ver todas</a>
+                    </div>
+                    <div class="table-wrap">
+                        <table>
+                            <thead><tr><th>Número</th><th>Cliente</th><th>Vencimiento</th><th>Total</th><th>Estado</th></tr></thead>
+                            <tbody id="tabla-facturas">
+                                <tr><td colspan="5"><div class="empty"><div class="eicon">⋯</div><p>Cargando…</p></div></td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </main>`;
+
+    // Logout
+    document.getElementById('btn-logout')?.addEventListener('click', async () => {
+        await signOut(auth);
+        window.location.href = 'login.html';
+    });
+    document.getElementById('user-name').textContent = user.email;
+    document.getElementById('user-avatar').textContent = user.email[0].toUpperCase();
+}
+
+function showSetupAlert(message, actions = []) {
+    const role = (sessionStorage.getItem('gp_user_role') || 'admin').toLowerCase();
+    if (role !== 'admin') return;
+
+    const box = document.getElementById('setup-alert');
+    const text = document.getElementById('setup-alert-text');
+    const actionsWrap = document.getElementById('setup-alert-actions');
+    if (!box || !text || !actionsWrap) return;
+
+    text.textContent = message;
+    actionsWrap.innerHTML = actions.map(a => `<a href="${a.href}" class="btn btn-ghost btn-sm">${a.label}</a>`).join('');
+    box.style.display = 'block';
+}
+
+async function loadKPIs() {
+    try {
+        // Ventas hoy
+        const hoy = new Date(); hoy.setHours(0,0,0,0);
+        const qHoy = query(collection(db,'ventas'), where('empresa_id','==',currentEmpresaId), where('created_at','>=', Timestamp.fromDate(hoy)));
+        const snapHoy = await getDocs(qHoy);
+        let totalHoy = 0;
+        snapHoy.forEach(d => totalHoy += d.data().total || 0);
+        document.getElementById('kpi-hoy').textContent = money(totalHoy);
+
+        // Ventas mes
+        const mes = new Date(); mes.setDate(1); mes.setHours(0,0,0,0);
+        const qMes = query(collection(db,'ventas'), where('empresa_id','==',currentEmpresaId), where('created_at','>=', Timestamp.fromDate(mes)));
+        const snapMes = await getDocs(qMes);
+        let totalMes = 0;
+        snapMes.forEach(d => totalMes += d.data().total || 0);
+        document.getElementById('kpi-mes').textContent = money(totalMes);
+
+        // Clientes
+        const snapCli = await getDocs(query(collection(db,'clientes'), where('empresa_id','==',currentEmpresaId)));
+        document.getElementById('kpi-clientes').textContent = snapCli.size;
+
+        // Productos stock bajo
+        const qStock = query(collection(db,'productos'), where('empresa_id','==',currentEmpresaId), where('activo','==',true));
+        const snapProd = await getDocs(qStock);
+        let stockBajo = 0;
+        snapProd.forEach(d => { const p = d.data(); if (p.stock_actual <= p.stock_minimo) stockBajo++; });
+        document.getElementById('kpi-stock').textContent = stockBajo;
+
+        // Facturas pendientes
+        const qFact = query(collection(db,'facturas'), where('empresa_id','==',currentEmpresaId), where('estado','==','pendiente'));
+        const snapFact = await getDocs(qFact);
+        document.getElementById('kpi-facturas').textContent = snapFact.size;
+
+        // Presupuestos activos
+        const qPres = query(collection(db,'presupuestos'), where('empresa_id','==',currentEmpresaId), where('estado','in',['borrador','enviado']));
+        const snapPres = await getDocs(qPres);
+        document.getElementById('kpi-presup').textContent = snapPres.size;
+
+        // Próximas facturas
+        const proxFact = query(collection(db,'facturas'), where('empresa_id','==',currentEmpresaId), where('estado','==','pendiente'));
+        const snapProx = await getDocs(proxFact);
+        const tbody = document.getElementById('tabla-facturas');
+        const proximas = snapProx.docs
+            .map(d => ({ id:d.id, ...d.data() }))
+            .sort((a,b) => {
+                const va = a.fecha_vencimiento?.toDate ? a.fecha_vencimiento.toDate() : new Date(a.fecha_vencimiento || 0);
+                const vb = b.fecha_vencimiento?.toDate ? b.fecha_vencimiento.toDate() : new Date(b.fecha_vencimiento || 0);
+                return va - vb;
+            })
+            .slice(0,8);
+
+        if (!proximas.length) {
+            tbody.innerHTML = `<tr><td colspan="5"><div class="empty"><div class="eicon">▣</div><p>No hay facturas pendientes — ¡todo al día!</p></div></td></tr>`;
+        } else {
+            tbody.innerHTML = proximas.map(f => {
+                const venc = f.fecha_vencimiento?.toDate ? f.fecha_vencimiento.toDate() : new Date(f.fecha_vencimiento);
+                const vencida = venc < new Date();
+                return `<tr>
+                    <td><span class="chip">${f.numero || f.id}</span></td>
+                    <td>${f.cliente_nombre || '—'}</td>
+                    <td style="color:${vencida?'var(--danger)':'var(--text)'}">${venc.toLocaleDateString('es-AR')}</td>
+                    <td style="font-family:'DM Mono',monospace;font-weight:600">${money(f.total)}</td>
+                    <td><span class="badge ${vencida?'b-danger':'b-warn'}">${vencida?'Vencida':'Pendiente'}</span></td>
+                </tr>`;
+            }).join('');
+        }
+    } catch(e) {
+        console.error(e);
+        toast('Error cargando datos', 'err');
+
+        const code = e?.code || '';
+        const msg = String(e?.message || '');
+        const isIndexError = code === 'failed-precondition' || /index|requires an index|query requires/i.test(msg);
+        const isRulesError = code === 'permission-denied' || /permission-denied|missing or insufficient permissions/i.test(msg);
+
+        if (isIndexError) {
+            showSetupAlert(
+                'Faltan índices de Firestore para algunas consultas. Publicá índices y reglas para terminar la puesta en marcha multiempresa.',
+                [
+                    { href: 'migracion-multiempresa.html', label: 'Abrir migración tenant' },
+                    { href: 'https://console.firebase.google.com/', label: 'Abrir Firebase Console' }
+                ]
+            );
+        } else if (isRulesError) {
+            showSetupAlert(
+                'Las reglas de Firestore bloquean acceso a datos. Verificá que estén publicadas las reglas multiempresa del proyecto.',
+                [
+                    { href: 'migracion-multiempresa.html', label: 'Abrir migración tenant' },
+                    { href: 'https://console.firebase.google.com/', label: 'Abrir Firebase Console' }
+                ]
+            );
+        }
+    }
+}
+</script>
+</body>
+</html>
