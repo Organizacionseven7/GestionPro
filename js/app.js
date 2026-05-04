@@ -41,6 +41,8 @@ const App = (() => {
   }
 
   // ── Utilities ──────────────────────────────────────────────────────────
+  // IDs consist only of base-36 alphanumeric chars ([a-z0-9]) and are safe
+  // to embed in onclick JavaScript string literals without further escaping.
   function generarId() {
     return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
   }
