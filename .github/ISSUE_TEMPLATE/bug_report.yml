@@ -1,0 +1,72 @@
+name: Bug report
+description: Reportar un error en la app
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Gracias por reportar el problema.
+        Completa la informacion para reproducirlo rapido.
+
+  - type: input
+    id: modulo
+    attributes:
+      label: Modulo afectado
+      description: Ej. login, usuarios, migracion-multiempresa, ventas
+      placeholder: migracion-multiempresa
+    validations:
+      required: true
+
+  - type: textarea
+    id: descripcion
+    attributes:
+      label: Descripcion del bug
+      placeholder: Que paso y que esperabas que pase
+    validations:
+      required: true
+
+  - type: textarea
+    id: pasos
+    attributes:
+      label: Pasos para reproducir
+      placeholder: |
+        1. Ir a ...
+        2. Hacer click en ...
+        3. Ver error ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidencia
+    attributes:
+      label: Evidencia (logs, screenshots, mensaje exacto)
+      placeholder: Pega mensaje de error exacto
+
+  - type: input
+    id: tenant
+    attributes:
+      label: empresa_id / tenant
+      description: Si aplica, indicar el tenant con el que sucedio
+      placeholder: Seven
+
+  - type: dropdown
+    id: severidad
+    attributes:
+      label: Severidad
+      options:
+        - Baja
+        - Media
+        - Alta
+        - Critica
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Confirmaciones
+      options:
+        - label: Revise que no sea configuracion local (cache, sesion, deploy antiguo)
+          required: true
+        - label: Inclui informacion suficiente para reproducir
+          required: true

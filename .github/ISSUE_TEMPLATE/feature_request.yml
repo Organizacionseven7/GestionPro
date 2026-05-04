@@ -1,0 +1,63 @@
+name: Feature request
+description: Proponer una mejora o nueva funcionalidad
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Usa este formulario para proponer mejoras.
+
+  - type: input
+    id: modulo
+    attributes:
+      label: Modulo relacionado
+      description: Ej. productos, reportes, usuarios, seguridad
+      placeholder: reportes
+    validations:
+      required: true
+
+  - type: textarea
+    id: problema
+    attributes:
+      label: Problema actual
+      placeholder: Que limitacion o dolor existe hoy
+    validations:
+      required: true
+
+  - type: textarea
+    id: propuesta
+    attributes:
+      label: Solucion propuesta
+      placeholder: Como deberia funcionar
+    validations:
+      required: true
+
+  - type: textarea
+    id: criterio
+    attributes:
+      label: Criterio de aceptacion
+      placeholder: |
+        - [ ] Caso 1
+        - [ ] Caso 2
+
+  - type: dropdown
+    id: prioridad
+    attributes:
+      label: Prioridad de negocio
+      options:
+        - Baja
+        - Media
+        - Alta
+        - Urgente
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: impacto
+    attributes:
+      label: Impacto esperado
+      options:
+        - label: Afecta flujo de ventas
+        - label: Afecta seguridad/permisos
+        - label: Afecta multiempresa (empresa_id)
+        - label: Mejora UX/productividad
