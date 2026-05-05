@@ -164,6 +164,12 @@ El repositorio ya incluye `.gitignore` para evitar subir:
 4. Pegar contenido de `docs/RELEASE_NOTES_v1.0.0.md`.
 5. Publicar release.
 
+## Automatizacion en GitHub
+
+- `CI` (`.github/workflows/ci.yml`): validaciones basicas en push/PR.
+- `CodeQL` (`.github/workflows/codeql.yml`): analisis de seguridad de codigo en push/PR y semanal.
+- `Dependabot` (`.github/dependabot.yml`): PRs automaticos de actualizacion de dependencias npm.
+
 ## Soporte rapido
 
 Si algo falla en produccion:
