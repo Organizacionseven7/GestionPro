@@ -152,6 +152,8 @@ El repositorio ya incluye `.gitignore` para evitar subir:
 ## Documentacion adicional
 
 - `INSTALACION.md`: guia extendida de instalacion y operacion.
+- `SECURITY.md`: politica de reporte de vulnerabilidades.
+- `docs/RELEASE_CHECKLIST.md`: checklist operativo para releases y deploy.
 
 ## Soporte rapido
 
