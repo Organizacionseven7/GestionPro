@@ -125,6 +125,21 @@ git push -u origin feature/nombre-corto
 
 4. Abrir Pull Request hacia `main`.
 
+## Proteccion de rama main (recomendado)
+
+Para evitar merges con errores, activar reglas en GitHub:
+
+1. Ir a `Settings > Branches > Add branch protection rule`.
+2. Branch name pattern: `main`.
+3. Activar `Require a pull request before merging`.
+4. Activar `Require approvals` (minimo 1).
+5. Activar `Require status checks to pass before merging`.
+6. Seleccionar el check de Actions: `validate` (workflow `CI`).
+7. Activar `Require branches to be up to date before merging`.
+8. Guardar cambios.
+
+Con esto, `main` solo acepta cambios revisados y con CI en verde.
+
 ## Archivos que NO deben subirse
 
 El repositorio ya incluye `.gitignore` para evitar subir:
