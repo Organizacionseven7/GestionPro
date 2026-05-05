@@ -17,7 +17,7 @@ import { auth, db } from './js/firebase-config.js';
 import { onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 import { collection, doc, getDocs, addDoc, updateDoc, query, where, orderBy, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-lite.js";
 import { renderSidebar } from './js/sidebar.js';
-import { toast, openModal, closeModal, money, dateStr, genId, ask } from './js/utils.js';
+import { toast, money, dateStr, genId, ask } from './js/utils.js';
 import { ensureUserActive } from './js/access-control.js';
 import { ensureRoleAllowed } from './js/access-control.js';
 import { getEmpresaId } from './js/access-control.js';
@@ -97,80 +97,138 @@ function renderApp() {
                     </div>
                     <div class="pag"><span id="pag-info">—</span></div>
                 </div>
+
+                <div class="card" id="panel-pres" style="display:none;margin-top:14px">
+                    <div class="card-header">
+                        <h2 id="modal-title">Nuevo presupuesto</h2>
+                        <button class="btn btn-ghost btn-sm" id="btn-cerrar-panel">Cerrar</button>
+                    </div>
+                    <div style="padding:12px">
+                        <div class="form-grid" style="margin-bottom:16px">
+                            <div class="fgroup"><label>Número</label><input class="inp" id="f-num" placeholder="Auto"></div>
+                            <div class="fgroup"><label>Fecha vencimiento</label><input class="inp" type="date" id="f-venc"></div>
+                            <div class="fgroup full"><label>Cliente</label>
+                                <input class="inp" id="f-cli-search" placeholder="Buscar cliente por nombre" oninput="window.filtrarClientesEnFormulario()" style="margin-bottom:8px">
+                                <select class="inp" id="f-cli"><option value="">Sin cliente</option></select>
+                            </div>
+                            <div class="fgroup full">
+                                <label>Cliente no registrado (manual)</label>
+                                <div style="display:grid;grid-template-columns:1fr auto;gap:8px">
+                                    <input class="inp" id="f-cli-manual" placeholder="Escribí nombre o razón social si no está en la lista" oninput="window.sugerirClienteManual()">
+                                    <button class="btn btn-ghost" type="button" id="btn-cli-manual-save">Guardar como cliente</button>
+                                </div>
+                                <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
+                                    <input class="inp" id="f-cli-manual-email" type="email" placeholder="Email (opcional)">
+                                    <input class="inp" id="f-cli-manual-tel" placeholder="Teléfono (opcional)">
+                                </div>
+                                <div id="f-cli-suggest" style="margin-top:8px"></div>
+                            </div>
+                            <div class="fgroup full"><label>Notas</label><input class="inp" id="f-notas" placeholder="Condiciones, observaciones…"></div>
+                        </div>
+
+                        <div style="font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">Productos</div>
+                        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+                            <input class="inp" id="sel-prod-search" placeholder="Buscar producto por escritura" oninput="window.filtrarProductosEnFormulario()" style="flex:1;min-width:220px">
+                        </div>
+                        <div style="display:flex;gap:8px;margin-bottom:12px">
+                            <select class="inp" id="sel-prod" style="flex:1"><option value="">— Seleccionar producto —</option></select>
+                            <input class="inp" type="number" id="sel-cant" min="1" value="1" style="width:70px">
+                            <button class="btn btn-ghost" id="btn-add-item">+ Agregar</button>
+                        </div>
+
+                        <div style="font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">Servicios</div>
+                        <div style="display:grid;grid-template-columns:1fr 80px 120px auto;gap:8px;margin-bottom:12px">
+                            <input class="inp" id="sel-servicio" placeholder="Ej: Instalación, Mantenimiento mensual, Asesoría técnica">
+                            <input class="inp" type="number" id="sel-serv-cant" min="1" value="1">
+                            <input class="inp" type="number" id="sel-serv-precio" min="0" step="0.01" placeholder="Precio">
+                            <button class="btn btn-ghost" id="btn-add-serv">+ Agregar servicio</button>
+                        </div>
+
+                        <div class="item-row header" style="padding:0 4px">
+                            <div>Ítem</div><div>Cant.</div><div>Precio unit.</div><div>Subtotal</div><div></div>
+                        </div>
+                        <div id="items-container"></div>
+
+                        <div class="totals-box">
+                            <div class="trow"><span>Subtotal</span><span id="t-sub">$0,00</span></div>
+                            <div class="trow"><label style="display:flex;align-items:center;gap:6px;color:var(--muted)">
+                                Descuento <input type="number" class="inp" id="t-desc" min="0" step="0.01" value="0" style="width:80px;padding:4px 8px" oninput="calcTotales()">
+                            </label><span id="t-descval">-$0,00</span></div>
+                            <div class="trow big"><span>TOTAL (sin IVA)</span><span id="t-total">$0,00</span></div>
+                        </div>
+
+                        <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px">
+                            <button class="btn btn-ghost" id="btn-cancelar-panel">Cancelar</button>
+                            <button class="btn btn-primary" id="btn-guardar">Guardar presupuesto</button>
+                        </div>
+                    </div>
+                </div>
             </div>
         </main>
-
-        <!-- MODAL PRESUPUESTO -->
-        <div class="overlay" id="modal-pres">
-            <div class="modal" style="max-width:720px">
-                <div class="modal-head">
-                    <h3 id="modal-title">Nuevo presupuesto</h3>
-                    <button class="btn btn-ghost btn-sm" onclick="closeModal('modal-pres')">✕</button>
-                </div>
-                <div class="modal-body">
-                    <div class="form-grid" style="margin-bottom:16px">
-                        <div class="fgroup"><label>Número</label><input class="inp" id="f-num" placeholder="Auto"></div>
-                        <div class="fgroup"><label>Fecha vencimiento</label><input class="inp" type="date" id="f-venc"></div>
-                        <div class="fgroup full"><label>Cliente</label>
-                            <select class="inp" id="f-cli"><option value="">Sin cliente</option></select>
-                        </div>
-                        <div class="fgroup full">
-                            <label>Cliente no registrado (manual)</label>
-                            <div style="display:grid;grid-template-columns:1fr auto;gap:8px">
-                                <input class="inp" id="f-cli-manual" placeholder="Escribí nombre o razón social si no está en la lista" oninput="window.sugerirClienteManual()">
-                                <button class="btn btn-ghost" type="button" id="btn-cli-manual-save">Guardar como cliente</button>
-                            </div>
-                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
-                                <input class="inp" id="f-cli-manual-email" type="email" placeholder="Email (opcional)">
-                                <input class="inp" id="f-cli-manual-tel" placeholder="Teléfono (opcional)">
-                            </div>
-                            <div id="f-cli-suggest" style="margin-top:8px"></div>
-                        </div>
-                        <div class="fgroup full"><label>Notas</label><input class="inp" id="f-notas" placeholder="Condiciones, observaciones…"></div>
-                    </div>
-
-                    <div style="font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">Productos</div>
-                    <div style="display:flex;gap:8px;margin-bottom:12px">
-                        <select class="inp" id="sel-prod" style="flex:1"><option value="">— Seleccionar producto —</option></select>
-                        <input class="inp" type="number" id="sel-cant" min="1" value="1" style="width:70px">
-                        <button class="btn btn-ghost" id="btn-add-item">+ Agregar</button>
-                    </div>
-
-                    <div style="font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">Servicios</div>
-                    <div style="display:grid;grid-template-columns:1fr 80px 120px auto;gap:8px;margin-bottom:12px">
-                        <input class="inp" id="sel-servicio" placeholder="Ej: Instalación, Mantenimiento mensual, Asesoría técnica">
-                        <input class="inp" type="number" id="sel-serv-cant" min="1" value="1">
-                        <input class="inp" type="number" id="sel-serv-precio" min="0" step="0.01" placeholder="Precio">
-                        <button class="btn btn-ghost" id="btn-add-serv">+ Agregar servicio</button>
-                    </div>
-
-                    <div class="item-row header" style="padding:0 4px">
-                        <div>Ítem</div><div>Cant.</div><div>Precio unit.</div><div>Subtotal</div><div></div>
-                    </div>
-                    <div id="items-container"></div>
-
-                    <div class="totals-box">
-                        <div class="trow"><span>Subtotal</span><span id="t-sub">$0,00</span></div>
-                        <div class="trow"><label style="display:flex;align-items:center;gap:6px;color:var(--muted)">
-                            Descuento <input type="number" class="inp" id="t-desc" min="0" step="0.01" value="0" style="width:80px;padding:4px 8px" oninput="calcTotales()">
-                        </label><span id="t-descval">-$0,00</span></div>
-                        <div class="trow big"><span>TOTAL (sin IVA)</span><span id="t-total">$0,00</span></div>
-                    </div>
-                </div>
-                <div class="modal-foot">
-                    <button class="btn btn-ghost" onclick="closeModal('modal-pres')">Cancelar</button>
-                    <button class="btn btn-primary" id="btn-guardar">Guardar presupuesto</button>
-                </div>
-            </div>
-        </div>`;
+        `;
 
     document.getElementById('btn-nuevo').addEventListener('click', abrirNuevo);
     document.getElementById('btn-guardar').addEventListener('click', guardar);
+    document.getElementById('btn-cerrar-panel').addEventListener('click', cerrarPanelPresupuesto);
+    document.getElementById('btn-cancelar-panel').addEventListener('click', cerrarPanelPresupuesto);
     document.getElementById('btn-cli-manual-save').addEventListener('click', guardarClienteManualDesdePresupuesto);
     document.getElementById('btn-add-item').addEventListener('click', agregarItem);
     document.getElementById('btn-add-serv').addEventListener('click', agregarServicio);
     document.querySelector('.btn-menu').addEventListener('click', ()=>document.querySelector('.sidebar').classList.toggle('open'));
 }
+
+function abrirPanelPresupuesto() {
+    const panel = document.getElementById('panel-pres');
+    if (!panel) return;
+    panel.style.display = 'block';
+    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function cerrarPanelPresupuesto() {
+    const panel = document.getElementById('panel-pres');
+    if (!panel) return;
+    panel.style.display = 'none';
+}
+
+function renderClientesSelect(term = '') {
+    const sel = document.getElementById('f-cli');
+    if (!sel) return;
+    const q = normTxt(term);
+    const list = !q ? clientes : clientes.filter(c => normTxt(c.nombre || '').includes(q));
+    sel.innerHTML = '<option value="">Sin cliente</option>';
+    list.forEach(c => { sel.innerHTML += `<option value="${c.id}">${c.nombre}</option>`; });
+}
+
+function renderProductosSelect(term = '') {
+    const sel = document.getElementById('sel-prod');
+    if (!sel) return;
+    const q = normTxt(term);
+    const list = !q ? productos : productos.filter(p => {
+        const base = `${p.codigo || ''} ${p.nombre || ''}`;
+        return normTxt(base).includes(q);
+    });
+    sel.innerHTML = '<option value="">— Seleccionar producto —</option>';
+    list.forEach(p => {
+        const cod = p.codigo ? `[${p.codigo}] ` : '';
+        sel.innerHTML += `<option value="${p.id}">${cod}${p.nombre} — ${money(p.precio_venta)}</option>`;
+    });
+}
+
+window.filtrarClientesEnFormulario = function() {
+    const txt = document.getElementById('f-cli-search')?.value || '';
+    const currentSelected = document.getElementById('f-cli')?.value || '';
+    renderClientesSelect(txt);
+    const opt = document.querySelector(`#f-cli option[value="${currentSelected}"]`);
+    if (opt) document.getElementById('f-cli').value = currentSelected;
+};
+
+window.filtrarProductosEnFormulario = function() {
+    const txt = document.getElementById('sel-prod-search')?.value || '';
+    const currentSelected = document.getElementById('sel-prod')?.value || '';
+    renderProductosSelect(txt);
+    const opt = document.querySelector(`#sel-prod option[value="${currentSelected}"]`);
+    if (opt) document.getElementById('sel-prod').value = currentSelected;
+};
 
 async function cargarClientes() {
     try {
@@ -178,10 +236,7 @@ async function cargarClientes() {
         clientes = snap.docs
             .map(d=>({id:d.id,...d.data()}))
             .sort((a,b) => (a.nombre||'').localeCompare((b.nombre||''), 'es', { sensitivity:'base' }));
-        const sel = document.getElementById('f-cli');
-        if (!sel) return;
-        sel.innerHTML = '<option value="">Sin cliente</option>';
-        clientes.forEach(c => sel.innerHTML += `<option value="${c.id}">${c.nombre}</option>`);
+        renderClientesSelect(document.getElementById('f-cli-search')?.value || '');
     } catch (e) {
         console.error('Error cargando clientes:', e);
         clientes = [];
@@ -304,13 +359,7 @@ async function cargarProductos() {
         productos = snap.docs
             .map(d=>({id:d.id,...d.data()}))
             .sort((a,b) => (a.nombre||'').localeCompare((b.nombre||''), 'es', { sensitivity:'base' }));
-        const sel = document.getElementById('sel-prod');
-        if (!sel) return;
-        sel.innerHTML = '<option value="">— Seleccionar producto —</option>';
-        productos.forEach(p => {
-            const cod = p.codigo ? `[${p.codigo}] ` : '';
-            sel.innerHTML += `<option value="${p.id}">${cod}${p.nombre} — ${money(p.precio_venta)}</option>`;
-        });
+        renderProductosSelect(document.getElementById('sel-prod-search')?.value || '');
     } catch (e) {
         console.error('Error cargando productos:', e);
         productos = [];
@@ -407,7 +456,11 @@ function abrirNuevo() {
     document.getElementById('sel-serv-cant').value = '1';
     document.getElementById('sel-serv-precio').value = '';
     renderItems();
-    openModal('modal-pres');
+    document.getElementById('f-cli-search').value = '';
+    document.getElementById('sel-prod-search').value = '';
+    renderClientesSelect('');
+    renderProductosSelect('');
+    abrirPanelPresupuesto();
 }
 
 window.editarPresupuesto = function(id) {
@@ -432,8 +485,12 @@ window.editarPresupuesto = function(id) {
         precio: parseFloat(it.precio) || 0,
         cantidad: parseInt(it.cantidad) || 1,
     }));
+    document.getElementById('f-cli-search').value = p.cliente_nombre || '';
+    document.getElementById('sel-prod-search').value = '';
+    renderClientesSelect(p.cliente_nombre || '');
+    renderProductosSelect('');
     renderItems();
-    openModal('modal-pres');
+    abrirPanelPresupuesto();
 };
 
 window.duplicarPresupuesto = function(id) {
@@ -458,8 +515,12 @@ window.duplicarPresupuesto = function(id) {
         precio: parseFloat(it.precio) || 0,
         cantidad: parseInt(it.cantidad) || 1,
     }));
+    document.getElementById('f-cli-search').value = p.cliente_nombre || '';
+    document.getElementById('sel-prod-search').value = '';
+    renderClientesSelect(p.cliente_nombre || '');
+    renderProductosSelect('');
     renderItems();
-    openModal('modal-pres');
+    abrirPanelPresupuesto();
 };
 
 function agregarItem() {
@@ -547,7 +608,7 @@ async function guardar() {
             await addDoc(collection(db,'presupuestos'), data);
             toast('Presupuesto creado');
         }
-        closeModal('modal-pres');
+        cerrarPanelPresupuesto();
         await cargar();
     } catch(e) { toast('Error: '+e.message,'err'); }
     finally { btn.disabled=false; btn.textContent='Guardar presupuesto'; }
