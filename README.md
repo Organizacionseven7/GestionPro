@@ -134,11 +134,18 @@ Para evitar merges con errores, activar reglas en GitHub:
 3. Activar `Require a pull request before merging`.
 4. Activar `Require approvals` (minimo 1).
 5. Activar `Require status checks to pass before merging`.
-6. Seleccionar el check de Actions: `validate` (workflow `CI`).
+6. Seleccionar checks obligatorios de Actions: `validate` (CI) y `Analyze` (CodeQL).
 7. Activar `Require branches to be up to date before merging`.
 8. Guardar cambios.
 
 Con esto, `main` solo acepta cambios revisados y con CI en verde.
+
+## Compartir repositorio
+
+- Repositorio: `https://github.com/Organizacionseven7/GestionPro`
+- Pull Requests: `https://github.com/Organizacionseven7/GestionPro/pulls`
+- Issues: `https://github.com/Organizacionseven7/GestionPro/issues`
+- Releases: `https://github.com/Organizacionseven7/GestionPro/releases`
 
 ## Archivos que NO deben subirse
 
