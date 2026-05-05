@@ -154,6 +154,15 @@ El repositorio ya incluye `.gitignore` para evitar subir:
 - `INSTALACION.md`: guia extendida de instalacion y operacion.
 - `SECURITY.md`: politica de reporte de vulnerabilidades.
 - `docs/RELEASE_CHECKLIST.md`: checklist operativo para releases y deploy.
+- `docs/RELEASE_NOTES_v1.0.0.md`: notas del primer release estable.
+
+## Publicar un release en GitHub
+
+1. Ir a `Releases > Draft a new release`.
+2. Seleccionar tag: `v1.0.0` (o el tag correspondiente).
+3. Titulo sugerido: `GestionPro v1.0.0`.
+4. Pegar contenido de `docs/RELEASE_NOTES_v1.0.0.md`.
+5. Publicar release.
 
 ## Soporte rapido
 
