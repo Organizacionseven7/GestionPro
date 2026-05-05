@@ -109,6 +109,7 @@ function renderApp() {
                             <div class="fgroup"><label>Fecha vencimiento</label><input class="inp" type="date" id="f-venc"></div>
                             <div class="fgroup full"><label>Cliente</label>
                                 <input class="inp" id="f-cli-search" placeholder="Buscar cliente por nombre" oninput="window.filtrarClientesEnFormulario()" style="margin-bottom:8px">
+                                <div id="f-cli-search-suggest" style="margin-bottom:8px"></div>
                                 <select class="inp" id="f-cli"><option value="">Sin cliente</option></select>
                             </div>
                             <div class="fgroup full">
@@ -130,6 +131,7 @@ function renderApp() {
                         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
                             <input class="inp" id="sel-prod-search" placeholder="Buscar producto por escritura" oninput="window.filtrarProductosEnFormulario()" style="flex:1;min-width:220px">
                         </div>
+                        <div id="sel-prod-search-suggest" style="margin-bottom:8px"></div>
                         <div style="display:flex;gap:8px;margin-bottom:12px">
                             <select class="inp" id="sel-prod" style="flex:1"><option value="">— Seleccionar producto —</option></select>
                             <input class="inp" type="number" id="sel-cant" min="1" value="1" style="width:70px">
@@ -220,6 +222,35 @@ window.filtrarClientesEnFormulario = function() {
     renderClientesSelect(txt);
     const opt = document.querySelector(`#f-cli option[value="${currentSelected}"]`);
     if (opt) document.getElementById('f-cli').value = currentSelected;
+
+    const box = document.getElementById('f-cli-search-suggest');
+    if (!box) return;
+    const q = normTxt(txt);
+    if (q.length < 2) { box.innerHTML = ''; return; }
+
+    const sugerencias = clientes.filter(c => normTxt(c.nombre || '').includes(q)).slice(0, 6);
+    if (!sugerencias.length) {
+        box.innerHTML = '<div style="font-size:11px;color:var(--muted)">Sin coincidencias</div>';
+        return;
+    }
+
+    box.innerHTML = `
+        <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Seleccioná un cliente:</div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px">
+            ${sugerencias.map(c => `<button type="button" class="btn btn-ghost btn-sm" style="padding:4px 8px" onclick="window.usarClienteBusqueda('${c.id}')">${esc(c.nombre || '')}</button>`).join('')}
+        </div>
+    `;
+};
+
+window.usarClienteBusqueda = function(id) {
+    const c = clientes.find(x => x.id === id);
+    if (!c) return;
+    const search = document.getElementById('f-cli-search');
+    const sel = document.getElementById('f-cli');
+    const box = document.getElementById('f-cli-search-suggest');
+    if (search) search.value = c.nombre || '';
+    if (sel) sel.value = c.id;
+    if (box) box.innerHTML = '';
 };
 
 window.filtrarProductosEnFormulario = function() {
@@ -228,6 +259,45 @@ window.filtrarProductosEnFormulario = function() {
     renderProductosSelect(txt);
     const opt = document.querySelector(`#sel-prod option[value="${currentSelected}"]`);
     if (opt) document.getElementById('sel-prod').value = currentSelected;
+
+    const box = document.getElementById('sel-prod-search-suggest');
+    if (!box) return;
+    const q = normTxt(txt);
+    if (q.length < 2) { box.innerHTML = ''; return; }
+
+    const sugerencias = productos.filter(p => {
+        const base = `${p.codigo || ''} ${p.nombre || ''}`;
+        return normTxt(base).includes(q);
+    }).slice(0, 6);
+
+    if (!sugerencias.length) {
+        box.innerHTML = '<div style="font-size:11px;color:var(--muted)">Sin coincidencias</div>';
+        return;
+    }
+
+    box.innerHTML = `
+        <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Seleccioná un producto:</div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px">
+            ${sugerencias.map(p => {
+                const cod = p.codigo ? `[${esc(p.codigo)}] ` : '';
+                return `<button type="button" class="btn btn-ghost btn-sm" style="padding:4px 8px" onclick="window.usarProductoBusqueda('${p.id}')">${cod}${esc(p.nombre || '')}</button>`;
+            }).join('')}
+        </div>
+    `;
+};
+
+window.usarProductoBusqueda = function(id) {
+    const p = productos.find(x => x.id === id);
+    if (!p) return;
+    const search = document.getElementById('sel-prod-search');
+    const sel = document.getElementById('sel-prod');
+    const box = document.getElementById('sel-prod-search-suggest');
+    if (search) {
+        const cod = p.codigo ? `[${p.codigo}] ` : '';
+        search.value = `${cod}${p.nombre}`;
+    }
+    if (sel) sel.value = p.id;
+    if (box) box.innerHTML = '';
 };
 
 async function cargarClientes() {
@@ -458,6 +528,8 @@ function abrirNuevo() {
     renderItems();
     document.getElementById('f-cli-search').value = '';
     document.getElementById('sel-prod-search').value = '';
+    document.getElementById('f-cli-search-suggest').innerHTML = '';
+    document.getElementById('sel-prod-search-suggest').innerHTML = '';
     renderClientesSelect('');
     renderProductosSelect('');
     abrirPanelPresupuesto();
@@ -487,6 +559,8 @@ window.editarPresupuesto = function(id) {
     }));
     document.getElementById('f-cli-search').value = p.cliente_nombre || '';
     document.getElementById('sel-prod-search').value = '';
+    document.getElementById('f-cli-search-suggest').innerHTML = '';
+    document.getElementById('sel-prod-search-suggest').innerHTML = '';
     renderClientesSelect(p.cliente_nombre || '');
     renderProductosSelect('');
     renderItems();
@@ -517,6 +591,8 @@ window.duplicarPresupuesto = function(id) {
     }));
     document.getElementById('f-cli-search').value = p.cliente_nombre || '';
     document.getElementById('sel-prod-search').value = '';
+    document.getElementById('f-cli-search-suggest').innerHTML = '';
+    document.getElementById('sel-prod-search-suggest').innerHTML = '';
     renderClientesSelect(p.cliente_nombre || '');
     renderProductosSelect('');
     renderItems();
